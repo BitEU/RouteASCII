@@ -39,10 +39,12 @@ routeascii/
 
 ## Building
 
-### Windows (MSVC + vcpkg)
-```cmd
-vcpkg install pdcurses curl
-cmake -B build -DCMAKE_TOOLCHAIN_FILE=[vcpkg-root]/scripts/buildsystems/vcpkg.cmake
+### Windows (MSVC + vcpkg, manifest mode)
+```powershell
+vcpkg x-update-baseline --add-initial-baseline
+vcpkg install
+$vcpkgRoot = Split-Path (Get-Command vcpkg).Source -Parent
+cmake -B build -DCMAKE_TOOLCHAIN_FILE="$vcpkgRoot\scripts\buildsystems\vcpkg.cmake"
 cmake --build build --config Release
 build\Release\routeascii.exe
 ```

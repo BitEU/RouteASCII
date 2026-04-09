@@ -12,7 +12,7 @@ set(SOURCES
     src/map.c
     src/route.c
     src/ui.c
-    src/cJSON.c
+    src/cjson.c
 )
 
 add_executable(routeascii ${SOURCES})

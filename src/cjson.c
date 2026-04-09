@@ -252,6 +252,6 @@ char *cJSON_GetStringValue(const cJSON *item)
 
 double cJSON_GetNumberValue(const cJSON *item)
 {
-    if (!item || !(item->type & cJSON_Number)) return 0.0/0.0;
+    if (!item || !(item->type & cJSON_Number)) return NAN;
     return item->valuedouble;
 }

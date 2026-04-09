@@ -1,0 +1,10 @@
+{
+  "name": "routeascii",
+  "version-string": "0.1.0",
+  "description": "ASCII TUI route plotter using curses and libcurl",
+  "dependencies": [
+    "curl",
+    "pdcurses"
+  ],
+  "builtin-baseline": "baababd134e882ca22d7432a915fc6feae882ce0"
+}
