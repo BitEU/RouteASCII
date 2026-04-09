@@ -244,6 +244,7 @@ int main(int argc, char *argv[])
 
     /* Cleanup */
     route_overlay_free(&overlay);
+    map_shutdown();
     ui_cleanup(&ui);
     http_cleanup();
 

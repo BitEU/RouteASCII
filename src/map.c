@@ -1,6 +1,10 @@
 #define _MAP_NEEDS_CURSES
 #include "map.h"
 #include "geo.h"
+#include "geodata.h"
+#include "render.h"
+#include "ui.h"
+
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -13,114 +17,35 @@
 #define MIN_ZOOM 2
 #define MAX_ZOOM 16
 
-/* ASCII shading ramp — used to give visual weight to landmass vs water.
-   Since we don't have actual tile image data in a pure-ASCII approach,
-   we render a simplified world outline + coordinate grid. */
+/* Global dataset held by the module — one per process. The alternative is
+ * to thread it through every map_* call, but the render routines already
+ * take a MapView pointer; adding a second pointer to the public API would
+ * ripple through main.c and the route code. Keep it file-local. */
+static GeoDataset g_dataset;
+static int        g_dataset_initialized = 0;
 
-/* Simplified continent boundary test using a very coarse bitmask approach.
-   For a real app you'd decode PNG tiles — here we use an embedded low-res
-   world bitmap for offline rendering. */
-
-/* 72x36 coarse world land mask (each cell = 5° × 5°)
-   1 = land, 0 = water. Row 0 = 90°N, Col 0 = 180°W */
-static const unsigned char WORLD_LAND[36][72] = {
-    /* 90N */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    /* 85N */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    /* 80N */ {0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0},
-    /* 75N */ {0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0},
-    /* 70N */ {0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,0},
-    /* 65N */ {0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,0,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,0},
-    /* 60N */ {0,0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,0,0,0,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,0,0},
-    /* 55N */ {0,0,0,0,0,0,0,0,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,0,0,0},
-    /* 50N */ {0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,0,0,0,1,1,1,1,1,1,1,1,1,0,0,0,0,1,1,1,1,1,1,1,1,1,0,0,0,0},
-    /* 45N */ {0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,0,0,0,0,0},
-    /* 40N */ {0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0},
-    /* 35N */ {0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0},
-    /* 30N */ {0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0},
-    /* 25N */ {0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0},
-    /* 20N */ {0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0},
-    /* 15N */ {0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0},
-    /* 10N */ {0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    /* 5N  */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    /* EQ  */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0},
-    /* 5S  */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0},
-    /* 10S */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0},
-    /* 15S */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0},
-    /* 20S */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0},
-    /* 25S */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0},
-    /* 30S */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0},
-    /* 35S */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0},
-    /* 40S */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    /* 45S */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0},
-    /* 50S */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    /* 55S */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    /* 60S */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    /* 65S */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    /* 70S */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    /* 75S */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    /* 80S */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-};
-
-/* Characters for rendering */
-#define CH_WATER    '~'
-#define CH_LAND     '#'
-#define CH_LAND2    '%'
-#define CH_BORDER   '.'
-#define CH_ROUTE    '*'
-#define CH_ORIGIN   'A'
-#define CH_DEST     'B'
-#define CH_GRID     '+'
-
-/* Check if a lat/lon is over land using the coarse bitmap */
-static int is_land(double lat, double lon)
+static void ensure_dataset(MapView *mv)
 {
-    /* Map lat (-90..90) to row (35..0), lon (-180..180) to col (0..71) */
-    int row = (int)((90.0 - lat) / 5.0);
-    int col = (int)((lon + 180.0) / 5.0);
-    if (row < 0) row = 0;
-    if (row > 35) row = 35;
-    if (col < 0) col = 0;
-    if (col > 71) col = 71;
-    return WORLD_LAND[row][col];
+    if (!g_dataset_initialized) {
+        geodata_init(&g_dataset);
+        g_dataset_initialized = 1;
+        /* Load the low-res LOD up front so the first frame has something
+         * to draw even if the user hasn't panned yet. */
+        geodata_ensure_lod(&g_dataset, LOD_110M);
+    }
+    GeoLod need = geodata_lod_for_zoom(mv->zoom);
+    if (!g_dataset.lod_loaded[need]) {
+        geodata_ensure_lod(&g_dataset, need);
+    }
 }
 
 void map_init(MapView *mv)
 {
-    /* Default: centered on the USA */
     mv->center_lat = 39.8;
     mv->center_lon = -98.5;
     mv->zoom = 4;
     mv->screen_w = 80;
     mv->screen_h = 24;
-}
-
-/* Compute the lat/lon for a screen cell */
-static void screen_cell_to_latlon(MapView *mv, int col, int row,
-                                  double *lat, double *lon)
-{
-    /* Each character cell represents a certain geographic span.
-       Terminal chars are ~2:1 aspect ratio (taller than wide),
-       so we scale accordingly. */
-    double center_px, center_py;
-    geo_latlon_to_pixel(mv->center_lat, mv->center_lon, mv->zoom,
-                        &center_px, &center_py);
-
-    /* Pixels per character cell — adjust for terminal aspect ratio */
-    double scale = 256.0 / (1 << (18 - mv->zoom));  /* pixels per char approx */
-    if (scale < 1.0) scale = 1.0;
-
-    /* Terminal chars are roughly 2x taller than wide */
-    double char_w = scale * 2.0;
-    double char_h = scale * 4.0;
-
-    double px = center_px + (col - mv->screen_w / 2.0) * char_w;
-    double py = center_py + (row - mv->screen_h / 2.0) * char_h;
-
-    /* Convert back to lat/lon */
-    int n = 1 << mv->zoom;
-    *lon = px / (n * 256.0) * 360.0 - 180.0;
-    double lat_rad = atan(sinh(M_PI * (1.0 - 2.0 * py / (n * 256.0))));
-    *lat = lat_rad * 180.0 / M_PI;
 }
 
 void map_render(WINDOW *win, MapView *mv, RouteOverlay *overlay)
@@ -130,77 +55,111 @@ void map_render(WINDOW *win, MapView *mv, RouteOverlay *overlay)
     mv->screen_w = max_x;
     mv->screen_h = max_y;
 
-    /* First pass: render base map */
-    for (int row = 0; row < max_y; row++) {
-        for (int col = 0; col < max_x; col++) {
-            double lat, lon;
-            screen_cell_to_latlon(mv, col, row, &lat, &lon);
-
-            /* Clamp */
-            if (lat > 85.0) lat = 85.0;
-            if (lat < -85.0) lat = -85.0;
-            while (lon > 180.0) lon -= 360.0;
-            while (lon < -180.0) lon += 360.0;
-
-            int land = is_land(lat, lon);
-
-            /* Grid lines every 10 degrees */
-            int on_grid = 0;
-            double glat = fmod(fabs(lat), 10.0);
-            double glon = fmod(fabs(lon), 10.0);
-            if (glat < 0.5 || glon < 0.5) on_grid = 1;
-
-            chtype ch;
-            if (land) {
-                if (on_grid)
-                    ch = CH_BORDER | COLOR_PAIR(3);
-                else
-                    ch = CH_LAND | COLOR_PAIR(2);
-            } else {
-                if (on_grid)
-                    ch = CH_GRID | COLOR_PAIR(4);
-                else
-                    ch = CH_WATER | COLOR_PAIR(1);
-            }
-
-            mvwaddch(win, row, col, ch);
+    ensure_dataset(mv);
+    GeoLod lod = geodata_lod_for_zoom(mv->zoom);
+    /* If the requested LOD failed to load (no network, say), fall back to
+     * whatever we do have. */
+    if (!g_dataset.lod_loaded[lod]) {
+        for (int l = 0; l < LOD_COUNT; l++) {
+            if (g_dataset.lod_loaded[l]) { lod = (GeoLod)l; break; }
         }
     }
 
-    /* Second pass: render route overlay */
+    /* --- 1. Clear to water --- */
+    render_clear_water(win);
+
+    /* --- 1b. Graticule on the water (land will overwrite it) --- */
+    render_graticule(win, mv);
+
+    /* --- 2. Fill land --- */
+    LayerStyle land_style = {
+        .cp = CP_LAND,  .attr = 0,
+        .fill_ch = '.', .stroke_ch = 0,  .use_slope = 0
+    };
+    render_polygon_layer(win, mv, &g_dataset.layers[lod][LAYER_LAND], &land_style);
+
+    /* --- 3. Carve lakes back out as water --- */
+    LayerStyle lake_style = {
+        .cp = CP_WATER, .attr = 0,
+        .fill_ch = ' ', .stroke_ch = 0, .use_slope = 0
+    };
+    render_polygon_layer(win, mv, &g_dataset.layers[lod][LAYER_LAKES], &lake_style);
+
+    /* --- 4. Rivers (linestrings) --- */
+    LayerStyle river_style = {
+        .cp = CP_WATER, .attr = A_DIM,
+        .fill_ch = 0,   .stroke_ch = '~', .use_slope = 0
+    };
+    render_line_layer(win, mv, &g_dataset.layers[lod][LAYER_RIVERS], &river_style);
+
+    /* --- 5. State / province borders (dim dotted) --- */
+    LayerStyle state_style = {
+        .cp = CP_BORDER, .attr = A_DIM,
+        .fill_ch = 0,    .stroke_ch = ':', .use_slope = 0
+    };
+    render_line_layer(win, mv, &g_dataset.layers[lod][LAYER_STATES], &state_style);
+
+    /* --- 6. Country borders (brighter dashed) --- */
+    LayerStyle country_style = {
+        .cp = CP_BORDER, .attr = A_BOLD,
+        .fill_ch = 0,    .stroke_ch = '+', .use_slope = 0
+    };
+    render_line_layer(win, mv, &g_dataset.layers[lod][LAYER_COUNTRIES], &country_style);
+
+    /* --- 7. Coastlines (sharp, slope-aware) --- */
+    LayerStyle coast_style = {
+        .cp = CP_LAND,  .attr = A_BOLD,
+        .fill_ch = 0,   .stroke_ch = '#', .use_slope = 1
+    };
+    render_line_layer(win, mv, &g_dataset.layers[lod][LAYER_COASTLINE], &coast_style);
+
+    /* --- 9. OSRM route overlay --- */
     if (overlay && overlay->has_route && overlay->count > 0) {
-        for (int i = 0; i < overlay->count; i++) {
-            int sc, sr;
-            if (map_latlon_to_screen(mv, overlay->points[i].lat,
-                                     overlay->points[i].lon, &sc, &sr)) {
-                mvwaddch(win, sr, sc, CH_ROUTE | COLOR_PAIR(5) | A_BOLD);
-            }
-        }
+        render_polyline_points(win, mv, overlay->points, overlay->count,
+                               '*', CP_ROUTE, A_BOLD);
 
-        /* Draw origin marker */
-        {
-            int sc, sr;
-            if (map_latlon_to_screen(mv, overlay->orig_lat,
-                                     overlay->orig_lon, &sc, &sr)) {
-                mvwaddch(win, sr, sc, CH_ORIGIN | COLOR_PAIR(6) | A_BOLD);
-            }
+        int sc, sr;
+        if (map_latlon_to_screen(mv, overlay->orig_lat, overlay->orig_lon,
+                                 &sc, &sr)) {
+            mvwaddch(win, sr, sc, 'A' | COLOR_PAIR(CP_MARKER) | A_BOLD);
         }
-        /* Draw destination marker */
-        {
-            int sc, sr;
-            if (map_latlon_to_screen(mv, overlay->dest_lat,
-                                     overlay->dest_lon, &sc, &sr)) {
-                mvwaddch(win, sr, sc, CH_DEST | COLOR_PAIR(6) | A_BOLD);
-            }
+        if (map_latlon_to_screen(mv, overlay->dest_lat, overlay->dest_lon,
+                                 &sc, &sr)) {
+            mvwaddch(win, sr, sc, 'B' | COLOR_PAIR(CP_MARKER) | A_BOLD);
         }
     }
+
+    /* --- 10. Cities (on top of everything except route markers) --- */
+    render_places_layer(win, mv, &g_dataset.layers[lod][LAYER_POP_PLACES]);
 
     wrefresh(win);
 }
 
+/* ---------- pan / zoom / conversions (unchanged from before) ---------- */
+
+static void screen_cell_to_latlon(MapView *mv, int col, int row,
+                                  double *lat, double *lon)
+{
+    double center_px, center_py;
+    geo_latlon_to_pixel(mv->center_lat, mv->center_lon, mv->zoom,
+                        &center_px, &center_py);
+
+    double scale = 256.0 / (double)(1 << (18 - mv->zoom));
+    if (scale < 1.0) scale = 1.0;
+    double char_w = scale * 2.0;
+    double char_h = scale * 4.0;
+
+    double px = center_px + (col - mv->screen_w / 2.0) * char_w;
+    double py = center_py + (row - mv->screen_h / 2.0) * char_h;
+
+    int n = 1 << mv->zoom;
+    *lon = px / (n * 256.0) * 360.0 - 180.0;
+    double lat_rad = atan(sinh(M_PI * (1.0 - 2.0 * py / (n * 256.0))));
+    *lat = lat_rad * 180.0 / M_PI;
+}
+
 void map_pan(MapView *mv, int dx, int dy)
 {
-    /* Convert dx/dy character cells to lat/lon shift */
     double lat1, lon1, lat2, lon2;
     screen_cell_to_latlon(mv, mv->screen_w / 2, mv->screen_h / 2, &lat1, &lon1);
     screen_cell_to_latlon(mv, mv->screen_w / 2 + 1, mv->screen_h / 2 + 1, &lat2, &lon2);
@@ -211,24 +170,14 @@ void map_pan(MapView *mv, int dx, int dy)
     mv->center_lon += dlon;
     mv->center_lat -= dlat;
 
-    /* Clamp */
     if (mv->center_lat > 85.0) mv->center_lat = 85.0;
     if (mv->center_lat < -85.0) mv->center_lat = -85.0;
     while (mv->center_lon > 180.0) mv->center_lon -= 360.0;
     while (mv->center_lon < -180.0) mv->center_lon += 360.0;
 }
 
-int map_zoom_in(MapView *mv)
-{
-    if (mv->zoom < MAX_ZOOM) mv->zoom++;
-    return mv->zoom;
-}
-
-int map_zoom_out(MapView *mv)
-{
-    if (mv->zoom > MIN_ZOOM) mv->zoom--;
-    return mv->zoom;
-}
+int map_zoom_in(MapView *mv)  { if (mv->zoom < MAX_ZOOM) mv->zoom++; return mv->zoom; }
+int map_zoom_out(MapView *mv) { if (mv->zoom > MIN_ZOOM) mv->zoom--; return mv->zoom; }
 
 void map_center_on(MapView *mv, double lat, double lon)
 {
@@ -250,7 +199,7 @@ int map_latlon_to_screen(MapView *mv, double lat, double lon, int *col, int *row
     double pt_px, pt_py;
     geo_latlon_to_pixel(lat, lon, mv->zoom, &pt_px, &pt_py);
 
-    double scale = 256.0 / (1 << (18 - mv->zoom));
+    double scale = 256.0 / (double)(1 << (18 - mv->zoom));
     if (scale < 1.0) scale = 1.0;
     double char_w = scale * 2.0;
     double char_h = scale * 4.0;
@@ -261,12 +210,9 @@ int map_latlon_to_screen(MapView *mv, double lat, double lon, int *col, int *row
     return (*col >= 0 && *col < mv->screen_w && *row >= 0 && *row < mv->screen_h);
 }
 
-/* Route overlay */
+/* ---------- route overlay (unchanged) ---------- */
 
-void route_overlay_init(RouteOverlay *ro)
-{
-    memset(ro, 0, sizeof(*ro));
-}
+void route_overlay_init(RouteOverlay *ro) { memset(ro, 0, sizeof(*ro)); }
 
 void route_overlay_free(RouteOverlay *ro)
 {
@@ -292,4 +238,15 @@ void route_overlay_clear(RouteOverlay *ro)
 {
     ro->count = 0;
     ro->has_route = 0;
+}
+
+/* ---------- teardown hook ----------
+ * Called from main.c at exit to free all vector data. We expose this via
+ * a weak helper — main.c will call it if present. */
+void map_shutdown(void)
+{
+    if (g_dataset_initialized) {
+        geodata_free(&g_dataset);
+        g_dataset_initialized = 0;
+    }
 }

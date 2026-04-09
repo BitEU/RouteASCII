@@ -9,6 +9,8 @@ set(SOURCES
     src/main.c
     src/http.c
     src/geo.c
+    src/geodata.c
+    src/render.c
     src/map.c
     src/route.c
     src/ui.c

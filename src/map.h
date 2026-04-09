@@ -39,6 +39,9 @@ typedef struct {
 /* Initialize default map view (centered on USA) */
 void map_init(MapView *mv);
 
+/* Free all cached vector data. Call once at program exit. */
+void map_shutdown(void);
+
 /* Render the ASCII map into the given curses window.
    If overlay is non-NULL and has_route, draw the route on top. */
 void map_render(WINDOW *win, MapView *mv, RouteOverlay *overlay);
