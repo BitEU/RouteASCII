@@ -427,20 +427,31 @@ static void render_line_pass(WINDOW *win, MapView *mv, Projector *p,
     }
 }
 
+/* How many lon-offset passes does this viewport need?
+ * Returns bitmask over {pass 0: base, pass 1: -360, pass 2: +360}.
+ * Only worth doing multi-pass near the antimeridian. */
+static int needed_passes(MapView *mv)
+{
+    GeoBBox v0; viewport_bbox(mv, 0.0, &v0);
+    int mask = 1; /* base pass always */
+    /* Viewport extends west of -180 → need the +360 pass so we pull data
+     * from east lons into view. */
+    if (v0.min_lon < -180.0f) mask |= 4;
+    /* Viewport extends east of +180 → need the -360 pass. */
+    if (v0.max_lon >  180.0f) mask |= 2;
+    return mask;
+}
+
 void render_polygon_layer(WINDOW *win, MapView *mv, const GeoLayer *layer,
                           const LayerStyle *style)
 {
     if (!layer || layer->nfeatures == 0) return;
-    /* Two passes: one at lon_offset=0, another at ±360 if the viewport
-     * crosses the antimeridian. */
+    int mask = needed_passes(mv);
     double offs[3] = {0.0, -360.0, 360.0};
     for (int k = 0; k < 3; k++) {
+        if (!(mask & (1 << k))) continue;
         Projector p; projector_init(&p, mv, offs[k]);
         GeoBBox vb; viewport_bbox(mv, offs[k], &vb);
-        /* Skip offset passes whose viewport bbox falls entirely outside ±180 */
-        if (k > 0) {
-            if (vb.max_lon < -180.0f || vb.min_lon > 180.0f) continue;
-        }
         render_polygon_pass(win, mv, &p, layer, style, &vb);
     }
 }
@@ -449,13 +460,12 @@ void render_line_layer(WINDOW *win, MapView *mv, const GeoLayer *layer,
                        const LayerStyle *style)
 {
     if (!layer || layer->nfeatures == 0) return;
+    int mask = needed_passes(mv);
     double offs[3] = {0.0, -360.0, 360.0};
     for (int k = 0; k < 3; k++) {
+        if (!(mask & (1 << k))) continue;
         Projector p; projector_init(&p, mv, offs[k]);
         GeoBBox vb; viewport_bbox(mv, offs[k], &vb);
-        if (k > 0) {
-            if (vb.max_lon < -180.0f || vb.min_lon > 180.0f) continue;
-        }
         render_line_pass(win, mv, &p, layer, style, &vb);
     }
 }

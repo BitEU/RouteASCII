@@ -29,14 +29,19 @@ static void ensure_dataset(MapView *mv)
     if (!g_dataset_initialized) {
         geodata_init(&g_dataset);
         g_dataset_initialized = 1;
-        /* Load the low-res LOD up front so the first frame has something
-         * to draw even if the user hasn't panned yet. */
+        /* Only the tiny 110m set is loaded at startup so the first frame
+         * is instant. 50m (~10MB) is loaded lazily the first time the user
+         * zooms in past 4. */
         geodata_ensure_lod(&g_dataset, LOD_110M);
     }
-    GeoLod need = geodata_lod_for_zoom(mv->zoom);
-    if (!g_dataset.lod_loaded[need]) {
-        geodata_ensure_lod(&g_dataset, need);
+    /* Lazy upgrade to 50m when the user zooms in. Still synchronous — a
+     * one-time ~seconds pause the first time it's needed, not every frame. */
+    if (mv->zoom >= 5 && !g_dataset.lod_loaded[LOD_50M]) {
+        geodata_ensure_lod(&g_dataset, LOD_50M);
     }
+    /* LOD_10M is intentionally NOT auto-loaded. It's ~100MB and would block
+     * the render thread long enough to look like a freeze. A future
+     * background-loader thread can upgrade to 10m without blocking input. */
 }
 
 void map_init(MapView *mv)

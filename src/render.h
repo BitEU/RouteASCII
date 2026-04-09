@@ -14,11 +14,11 @@
 
 /* Style for a single layer — what char to use and what color pair. */
 typedef struct {
-    int  cp;         /* curses color pair */
-    int  attr;       /* A_BOLD, A_DIM, etc. */
-    char fill_ch;    /* for polygon interiors */
-    char stroke_ch;  /* for polyline strokes and polygon outlines (0 = none) */
-    int  use_slope;  /* if non-zero, pick - | / \ from segment direction */
+    int cp;          /* curses color pair */
+    int attr;        /* A_BOLD, A_DIM, etc. */
+    int fill_ch;     /* for polygon interiors (0 = none) */
+    int stroke_ch;   /* for polyline strokes and polygon outlines (0 = none) */
+    int use_slope;   /* if non-zero, pick - | / \ from segment direction */
 } LayerStyle;
 
 /* Clear the window to the water/background character. */
