@@ -12,6 +12,8 @@ set(SOURCES
     src/geodata.c
     src/render.c
     src/subpixel.c
+    src/mbtiles.c
+    src/mvt.c
     src/osm.c
     src/map.c
     src/route.c
@@ -49,6 +51,21 @@ endif()
 find_package(CURL REQUIRED)
 target_include_directories(routeascii PRIVATE ${CURL_INCLUDE_DIRS})
 target_link_libraries(routeascii PRIVATE ${CURL_LIBRARIES})
+
+# sqlite3 — used by mbtiles.c to read the local us.mbtiles file
+find_package(unofficial-sqlite3 CONFIG QUIET)
+if(unofficial-sqlite3_FOUND)
+    target_link_libraries(routeascii PRIVATE unofficial::sqlite3::sqlite3)
+else()
+    find_package(SQLite3 REQUIRED)
+    target_include_directories(routeascii PRIVATE ${SQLite3_INCLUDE_DIRS})
+    target_link_libraries(routeascii PRIVATE ${SQLite3_LIBRARIES})
+endif()
+
+# zlib — used by mvt.c to gunzip tile blobs stored in MBTiles
+find_package(ZLIB REQUIRED)
+target_include_directories(routeascii PRIVATE ${ZLIB_INCLUDE_DIRS})
+target_link_libraries(routeascii PRIVATE ${ZLIB_LIBRARIES})
 
 # Math library (Linux)
 if(UNIX)

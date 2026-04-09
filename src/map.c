@@ -129,38 +129,71 @@ void map_render(WINDOW *win, MapView *mv, RouteOverlay *overlay)
     };
     render_line_layer(win, mv, &g_dataset.layers[lod][LAYER_COASTLINE], &coast_style);
 
-    /* --- 7b. OSM vector detail at high zoom ---
-     * At zoom 9+ we overlay real OSM road networks, waterways, and
-     * waterbodies fetched from Overpass. Tiles are loaded lazily in the
-     * main loop via map_tick(); this call only requests coverage for the
-     * current viewport and renders whatever has already been fetched. */
-    if (mv->zoom >= 9) {
+    /* --- 7b. OSM vector detail from local MBTiles ---
+     * Starting at zoom 6 (where Natural Earth starts showing its age) we
+     * overlay real OSM road networks, waterways, and waterbodies from a
+     * local us.mbtiles file generated offline by tilemaker. If the file
+     * is missing the layers will be empty and we degrade gracefully. */
+    if (mv->zoom >= 6) {
         if (!g_osm_initialized) { osm_init(&g_osm); g_osm_initialized = 1; }
         osm_request_viewport(&g_osm, mv);
 
-        LayerStyle osm_water = {
+        /* Water polygons — render as fills so lakes/reservoirs punch
+         * through land. Note: rendered BEFORE strokes so route/roads
+         * sit on top. */
+        LayerStyle osm_water_fill = {
             .cp = CP_WATER, .attr = 0,
-            .fill_ch = 0,   .stroke_ch = '~', .use_slope = 0
+            .fill_ch = ' ', .stroke_ch = 0, .use_slope = 0
         };
-        render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_WATER], &osm_water);
+        render_polygon_layer(win, mv, &g_osm.layers[OSM_LAYER_WATER], &osm_water_fill);
 
+        /* Rivers / streams */
         LayerStyle osm_waterway = {
             .cp = CP_WATER, .attr = A_DIM,
             .fill_ch = 0,   .stroke_ch = '~', .use_slope = 0
         };
         render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_WATERWAY], &osm_waterway);
 
-        LayerStyle osm_road_minor = {
-            .cp = CP_GRID,  .attr = A_DIM,
-            .fill_ch = 0,   .stroke_ch = '-', .use_slope = 0
-        };
-        render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_MINOR], &osm_road_minor);
+        /* ---- Per-zoom road class filter ----
+         * Restricting which classes render at low/mid zoom keeps the
+         * map readable. At zoom 6-8 we only want the interstates; by
+         * zoom 14 we want every residential street. */
+        int show_motorway  = mv->zoom >= 6;
+        int show_trunk     = mv->zoom >= 6;
+        int show_primary   = mv->zoom >= 8;
+        int show_secondary = mv->zoom >= 9;
+        int show_tertiary  = mv->zoom >= 11;
+        int show_minor     = mv->zoom >= 12;
+        int show_service   = mv->zoom >= 14;
+        int show_path      = mv->zoom >= 15;
 
-        LayerStyle osm_road_major = {
-            .cp = CP_BORDER, .attr = A_BOLD,
-            .fill_ch = 0,    .stroke_ch = '=', .use_slope = 0
-        };
-        render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_MAJOR], &osm_road_major);
+        /* Styles: thicker/bolder glyphs for the more important classes. */
+        LayerStyle st_motorway  = { .cp = CP_BORDER, .attr = A_BOLD,
+                                    .fill_ch = 0, .stroke_ch = '=', .use_slope = 0 };
+        LayerStyle st_trunk     = { .cp = CP_BORDER, .attr = A_BOLD,
+                                    .fill_ch = 0, .stroke_ch = '=', .use_slope = 0 };
+        LayerStyle st_primary   = { .cp = CP_BORDER, .attr = 0,
+                                    .fill_ch = 0, .stroke_ch = '-', .use_slope = 1 };
+        LayerStyle st_secondary = { .cp = CP_BORDER, .attr = 0,
+                                    .fill_ch = 0, .stroke_ch = '-', .use_slope = 1 };
+        LayerStyle st_tertiary  = { .cp = CP_GRID, .attr = 0,
+                                    .fill_ch = 0, .stroke_ch = '-', .use_slope = 1 };
+        LayerStyle st_minor     = { .cp = CP_GRID, .attr = A_DIM,
+                                    .fill_ch = 0, .stroke_ch = '.', .use_slope = 0 };
+        LayerStyle st_service   = { .cp = CP_GRID, .attr = A_DIM,
+                                    .fill_ch = 0, .stroke_ch = '.', .use_slope = 0 };
+        LayerStyle st_path      = { .cp = CP_GRID, .attr = A_DIM,
+                                    .fill_ch = 0, .stroke_ch = ':', .use_slope = 0 };
+
+        /* Draw order: least important first so majors sit on top. */
+        if (show_path)      render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_PATH], &st_path);
+        if (show_service)   render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_SERVICE], &st_service);
+        if (show_minor)     render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_MINOR], &st_minor);
+        if (show_tertiary)  render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_TERTIARY], &st_tertiary);
+        if (show_secondary) render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_SECONDARY], &st_secondary);
+        if (show_primary)   render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_PRIMARY], &st_primary);
+        if (show_trunk)     render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_TRUNK], &st_trunk);
+        if (show_motorway)  render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_MOTORWAY], &st_motorway);
     }
 
     /* --- 9. OSRM route overlay (drawn into braille canvas too) --- */
@@ -187,7 +220,14 @@ void map_render(WINDOW *win, MapView *mv, RouteOverlay *overlay)
         }
     }
 
-    render_places_layer(win, mv, &g_dataset.layers[lod][LAYER_POP_PLACES]);
+    /* At zoom 9+ prefer the OMT `place` layer (every village with a
+     * name) over Natural Earth's ~1000-city list. NE still wins below
+     * that because OMT's place layer is sparse at low zoom levels. */
+    if (mv->zoom >= 9 && g_osm_initialized && g_osm.mbtiles_ok) {
+        render_places_layer(win, mv, &g_osm.layers[OSM_LAYER_PLACE]);
+    } else {
+        render_places_layer(win, mv, &g_dataset.layers[lod][LAYER_POP_PLACES]);
+    }
 
     wrefresh(win);
 }

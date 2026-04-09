@@ -1,3 +1,7 @@
 \vcpkg_installed
 \build
 \data
+*.pbf
+*.pbf.part
+\tilemaker-windows
+\.claude

@@ -1,408 +1,322 @@
 #include "osm.h"
-#include "http.h"
+#include "mbtiles.h"
+#include "mvt.h"
 #include "geo.h"
-#include "cJSON.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <sys/stat.h>
-
-#ifdef _WIN32
-#include <direct.h>
-#define MKDIR(p) _mkdir(p)
-#else
-#include <unistd.h>
-#define MKDIR(p) mkdir(p, 0755)
-#endif
-
-#define OSM_TILE_Z     13
-#define OSM_MAX_TILES  512      /* soft cap on how many tiles we track */
-#define OVERPASS_URL   "https://overpass-api.de/api/interpreter"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
 /* ---------------------------------------------------------------------------
- * Tile tracking.
+ * MBTiles-backed OSM cache.
+ *
+ * We open a single MBTiles file (data/us.mbtiles) at startup. On each
+ * viewport update we compute the set of z=14 tiles that cover the view,
+ * look them up in an in-memory LRU, and decode any misses from the
+ * MBTiles file via MVT. cache->layers is rebuilt by concatenating
+ * features from every tile in the visible set.
+ *
+ * The LRU caps how many decoded tiles we keep in memory at once. A
+ * typical zoom-10 viewport covers ~16 tiles; a wide zoom-8 viewport can
+ * cover ~200. We cap at 512 tiles, and when a tile falls out of the
+ * visible set it stays in the LRU until evicted.
  * -------------------------------------------------------------------------*/
 
-typedef enum {
-    TS_EMPTY = 0,
-    TS_PENDING,
-    TS_LOADED,
-    TS_FAILED
-} TileStatus;
+#define OSM_MIN_TILE_ZOOM  6   /* below this, Natural Earth is enough */
+#define OSM_TILE_Z        14   /* MBTiles are baked at z=14 */
+#define LRU_CAP          512
+#define MBTILES_DEFAULT_PATH "data/us.mbtiles"
 
-typedef struct {
-    int        x, y;
-    TileStatus status;
-    /* Per-tile feature indices into the cache's flat layers. We don't
-     * actually track these — on cache invalidation we rebuild the whole
-     * thing. Kept simple on purpose. */
-} TileSlot;
-
-static TileSlot g_tiles[OSM_MAX_TILES];
-static int      g_tile_count = 0;
-
-/* Find a tile slot by coords, or -1. */
-static int tile_find(int x, int y)
+/* Resolve the MBTiles path: ROUTEASCII_MBTILES env var wins if set, else
+ * fall back to data/us.mbtiles. Set the env var when testing with a
+ * smaller extract (e.g. data/nj.mbtiles). */
+static const char *resolve_mbtiles_path(void)
 {
-    for (int i = 0; i < g_tile_count; i++) {
-        if (g_tiles[i].x == x && g_tiles[i].y == y) return i;
-    }
-    return -1;
+    const char *env = getenv("ROUTEASCII_MBTILES");
+    if (env && *env) return env;
+    return MBTILES_DEFAULT_PATH;
 }
 
-static int tile_add(int x, int y, TileStatus st)
+typedef struct TileEntry {
+    int       z, x, y;
+    int       valid;
+    /* Per-tile decoded layers — same shape as OsmCache::layers, but
+     * holding only this tile's features. */
+    GeoLayer  layers[OSM_LAYER_COUNT];
+    /* LRU bookkeeping: usage counter incremented on touch; oldest
+     * entry wins eviction. Simpler than a real doubly-linked list. */
+    unsigned  last_used;
+} TileEntry;
+
+static Mbtiles  *g_mb = NULL;
+static TileEntry g_lru[LRU_CAP];
+static int       g_lru_n = 0;
+static unsigned  g_lru_clock = 0;
+
+/* Track the set of currently visible tiles so we can skip work when the
+ * viewport hasn't moved into new tiles. */
+static int g_vis_x0 = 0, g_vis_y0 = 0, g_vis_x1 = -1, g_vis_y1 = -1;
+static int g_vis_z  = -1;
+
+/* ---------------------------------------------------------------------------
+ * LRU helpers.
+ * ---------------------------------------------------------------------*/
+
+static TileEntry *lru_find(int z, int x, int y)
 {
-    if (g_tile_count >= OSM_MAX_TILES) {
-        /* Evict the oldest loaded tile — LRU-ish. */
-        for (int i = 0; i < g_tile_count; i++) {
-            if (g_tiles[i].status == TS_LOADED) {
-                g_tiles[i].x = x; g_tiles[i].y = y; g_tiles[i].status = st;
-                return i;
-            }
+    for (int i = 0; i < g_lru_n; i++) {
+        if (g_lru[i].valid &&
+            g_lru[i].z == z && g_lru[i].x == x && g_lru[i].y == y)
+            return &g_lru[i];
+    }
+    return NULL;
+}
+
+static void tile_entry_free_layers(TileEntry *te)
+{
+    for (int i = 0; i < OSM_LAYER_COUNT; i++) {
+        geolayer_free(&te->layers[i]);
+    }
+}
+
+static TileEntry *lru_allocate(int z, int x, int y)
+{
+    /* First try a free slot. */
+    if (g_lru_n < LRU_CAP) {
+        TileEntry *te = &g_lru[g_lru_n++];
+        memset(te, 0, sizeof(*te));
+        te->z = z; te->x = x; te->y = y; te->valid = 1;
+        te->last_used = ++g_lru_clock;
+        return te;
+    }
+    /* Otherwise evict the least-recently-used entry. */
+    int victim = 0;
+    for (int i = 1; i < g_lru_n; i++) {
+        if (g_lru[i].last_used < g_lru[victim].last_used) victim = i;
+    }
+    TileEntry *te = &g_lru[victim];
+    tile_entry_free_layers(te);
+    memset(te, 0, sizeof(*te));
+    te->z = z; te->x = x; te->y = y; te->valid = 1;
+    te->last_used = ++g_lru_clock;
+    return te;
+}
+
+static void lru_touch(TileEntry *te)
+{
+    te->last_used = ++g_lru_clock;
+}
+
+/* ---------------------------------------------------------------------------
+ * Tile load: pull from MBTiles, decode, populate LRU entry.
+ * ---------------------------------------------------------------------*/
+
+static TileEntry *load_tile(int z, int x, int y)
+{
+    TileEntry *te = lru_find(z, x, y);
+    if (te) { lru_touch(te); return te; }
+    if (!g_mb) return NULL;
+
+    unsigned char *blob = NULL;
+    size_t blob_size = 0;
+    if (mbtiles_get_tile(g_mb, z, x, y, &blob, &blob_size) != 0) {
+        /* Cache the miss as an empty slot so we don't try again. */
+        te = lru_allocate(z, x, y);
+        return te;
+    }
+
+    te = lru_allocate(z, x, y);
+    /* The MVT decoder appends into an OsmCache's layer array. We want
+     * it to append into the tile entry's per-tile layer array instead,
+     * so build a temporary OsmCache "view" that points at te->layers,
+     * run the decode, then copy the (updated) layer structs back. Each
+     * GeoLayer contains only a features pointer + counts, so the copy
+     * is safe — we're transferring ownership of the heap features
+     * buffer from shim to te. */
+    OsmCache shim;
+    memset(&shim, 0, sizeof(shim));
+    mvt_decode_tile(&shim, z, x, y, blob, blob_size);
+    memcpy(te->layers, shim.layers, sizeof(shim.layers));
+    free(blob);
+    return te;
+}
+
+/* ---------------------------------------------------------------------------
+ * Merge one tile's layers into the public cache->layers. We can't move
+ * the features (the LRU still owns them), so we deep-copy them. This is
+ * a few hundred malloc's per tile worst case — fast enough that we
+ * redo it any time the visible set changes.
+ * ---------------------------------------------------------------------*/
+
+static GeoRing ring_dup(const GeoRing *src)
+{
+    GeoRing dst = {0};
+    if (src->npoints <= 0 || !src->coords) return dst;
+    dst.coords = malloc((size_t)src->npoints * 2 * sizeof(float));
+    if (!dst.coords) return dst;
+    memcpy(dst.coords, src->coords, (size_t)src->npoints * 2 * sizeof(float));
+    dst.npoints = src->npoints;
+    return dst;
+}
+
+static void layer_append_copy(GeoLayer *dst, const GeoLayer *src)
+{
+    for (int i = 0; i < src->nfeatures; i++) {
+        const GeoFeature *sf = &src->features[i];
+        GeoFeature nf = *sf;
+        nf.rings = calloc((size_t)sf->nrings, sizeof(GeoRing));
+        if (!nf.rings) continue;
+        nf.nrings = 0;
+        for (int r = 0; r < sf->nrings; r++) {
+            nf.rings[nf.nrings] = ring_dup(&sf->rings[r]);
+            if (nf.rings[nf.nrings].coords) nf.nrings++;
         }
-        return -1;
-    }
-    g_tiles[g_tile_count].x = x;
-    g_tiles[g_tile_count].y = y;
-    g_tiles[g_tile_count].status = st;
-    return g_tile_count++;
-}
-
-/* ---------------------------------------------------------------------------
- * Disk cache paths.
- * -------------------------------------------------------------------------*/
-
-static void mkdirp(const char *path)
-{
-    struct stat st;
-    if (stat(path, &st) == 0) return;
-    MKDIR(path);
-}
-
-static void tile_path(int x, int y, char *out, size_t out_sz)
-{
-    mkdirp("data");
-    mkdirp("data/osm_cache");
-    char dir[256];
-    snprintf(dir, sizeof(dir), "data/osm_cache/%d", OSM_TILE_Z);
-    mkdirp(dir);
-    snprintf(dir, sizeof(dir), "data/osm_cache/%d/%d", OSM_TILE_Z, x);
-    mkdirp(dir);
-    snprintf(out, out_sz, "data/osm_cache/%d/%d/%d.json", OSM_TILE_Z, x, y);
-}
-
-static int file_exists(const char *path)
-{
-    struct stat st;
-    return stat(path, &st) == 0 && st.st_size > 0;
-}
-
-/* ---------------------------------------------------------------------------
- * Tile <-> bbox conversion.
- * -------------------------------------------------------------------------*/
-
-static void tile_bbox(int x, int y, double *s, double *w, double *n, double *e)
-{
-    int N = 1 << OSM_TILE_Z;
-    *w = (double)x / N * 360.0 - 180.0;
-    *e = (double)(x + 1) / N * 360.0 - 180.0;
-    double n_rad = atan(sinh(M_PI * (1.0 - 2.0 * (double)y / N)));
-    double s_rad = atan(sinh(M_PI * (1.0 - 2.0 * (double)(y + 1) / N)));
-    *n = n_rad * 180.0 / M_PI;
-    *s = s_rad * 180.0 / M_PI;
-}
-
-static void latlon_to_tile(double lat, double lon, int *x, int *y)
-{
-    int N = 1 << OSM_TILE_Z;
-    double lat_rad = lat * M_PI / 180.0;
-    *x = (int)floor((lon + 180.0) / 360.0 * N);
-    *y = (int)floor((1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / M_PI) / 2.0 * N);
-    if (*x < 0) *x = 0; if (*x >= N) *x = N - 1;
-    if (*y < 0) *y = 0; if (*y >= N) *y = N - 1;
-}
-
-/* ---------------------------------------------------------------------------
- * Layer storage helpers — wrap the GeoLayer/GeoFeature machinery for
- * linestring features built from Overpass way geometries.
- * -------------------------------------------------------------------------*/
-
-static void push_way(GeoLayer *layer, cJSON *geom_arr)
-{
-    if (!cJSON_IsArray(geom_arr)) return;
-    int n = cJSON_GetArraySize(geom_arr);
-    if (n < 2) return;
-
-    GeoFeature f = {0};
-    f.type = GEOM_LINESTRING;
-    f.bbox.min_lat =  90.0f; f.bbox.max_lat = -90.0f;
-    f.bbox.min_lon = 180.0f; f.bbox.max_lon = -180.0f;
-    f.rings = calloc(1, sizeof(GeoRing));
-    if (!f.rings) return;
-    f.rings[0].coords = malloc((size_t)n * 2 * sizeof(float));
-    if (!f.rings[0].coords) { free(f.rings); return; }
-
-    int ci = 0;
-    for (int i = 0; i < n; i++) {
-        cJSON *pt = cJSON_GetArrayItem(geom_arr, i);
-        if (!cJSON_IsObject(pt)) continue;
-        cJSON *jlat = cJSON_GetObjectItem(pt, "lat");
-        cJSON *jlon = cJSON_GetObjectItem(pt, "lon");
-        if (!cJSON_IsNumber(jlat) || !cJSON_IsNumber(jlon)) continue;
-        float lat = (float)jlat->valuedouble;
-        float lon = (float)jlon->valuedouble;
-        f.rings[0].coords[ci * 2 + 0] = lon;
-        f.rings[0].coords[ci * 2 + 1] = lat;
-        if (lat < f.bbox.min_lat) f.bbox.min_lat = lat;
-        if (lat > f.bbox.max_lat) f.bbox.max_lat = lat;
-        if (lon < f.bbox.min_lon) f.bbox.min_lon = lon;
-        if (lon > f.bbox.max_lon) f.bbox.max_lon = lon;
-        ci++;
-    }
-    if (ci < 2) { free(f.rings[0].coords); free(f.rings); return; }
-    f.rings[0].npoints = ci;
-    f.nrings = 1;
-    geolayer_add(layer, f);
-}
-
-/* Classify an OSM way by its tags into one of our layers. Returns -1 to
- * drop the way. */
-static int classify_way(cJSON *tags)
-{
-    if (!cJSON_IsObject(tags)) return -1;
-    cJSON *hw = cJSON_GetObjectItem(tags, "highway");
-    if (cJSON_IsString(hw)) {
-        const char *v = hw->valuestring;
-        if (!strcmp(v, "motorway")    || !strcmp(v, "motorway_link") ||
-            !strcmp(v, "trunk")       || !strcmp(v, "trunk_link") ||
-            !strcmp(v, "primary")     || !strcmp(v, "primary_link"))
-            return OSM_LAYER_ROAD_MAJOR;
-        /* Drop footpaths/cycleways — too much noise. */
-        if (!strcmp(v, "footway")   || !strcmp(v, "path") ||
-            !strcmp(v, "cycleway")  || !strcmp(v, "steps") ||
-            !strcmp(v, "track")     || !strcmp(v, "service"))
-            return -1;
-        return OSM_LAYER_ROAD_MINOR;
-    }
-    cJSON *wa = cJSON_GetObjectItem(tags, "waterway");
-    if (cJSON_IsString(wa)) return OSM_LAYER_WATERWAY;
-    cJSON *nat = cJSON_GetObjectItem(tags, "natural");
-    if (cJSON_IsString(nat) && !strcmp(nat->valuestring, "water"))
-        return OSM_LAYER_WATER;
-    return -1;
-}
-
-/* Parse a full Overpass JSON response and append features to the cache. */
-static int parse_tile_json(OsmCache *cache, const char *json, size_t sz)
-{
-    (void)sz;
-    cJSON *root = cJSON_Parse(json);
-    if (!root) return -1;
-    cJSON *elements = cJSON_GetObjectItem(root, "elements");
-    if (!cJSON_IsArray(elements)) { cJSON_Delete(root); return -1; }
-
-    int ne = cJSON_GetArraySize(elements);
-    for (int i = 0; i < ne; i++) {
-        cJSON *el = cJSON_GetArrayItem(elements, i);
-        cJSON *type_j = cJSON_GetObjectItem(el, "type");
-        if (!cJSON_IsString(type_j)) continue;
-        if (strcmp(type_j->valuestring, "way") != 0) continue;
-        cJSON *tags = cJSON_GetObjectItem(el, "tags");
-        int lid = classify_way(tags);
-        if (lid < 0 || lid >= OSM_LAYER_COUNT) continue;
-        cJSON *geom = cJSON_GetObjectItem(el, "geometry");
-        push_way(&cache->layers[lid], geom);
-    }
-    cJSON_Delete(root);
-    return 0;
-}
-
-/* Read a cached tile file into the cache layers. */
-static int load_cached_tile(OsmCache *cache, const char *path)
-{
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return -1;
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (sz <= 0) { fclose(fp); return -1; }
-    char *buf = malloc((size_t)sz + 1);
-    if (!buf) { fclose(fp); return -1; }
-    size_t got = fread(buf, 1, (size_t)sz, fp);
-    fclose(fp);
-    buf[got] = '\0';
-    int rc = parse_tile_json(cache, buf, got);
-    free(buf);
-    return rc;
-}
-
-/* Build the Overpass QL query for a single tile. */
-static void build_query(int x, int y, char *out, size_t out_sz)
-{
-    double s, w, n, e;
-    tile_bbox(x, y, &s, &w, &n, &e);
-    snprintf(out, out_sz,
-        "[out:json][timeout:25][bbox:%.6f,%.6f,%.6f,%.6f];"
-        "("
-        "way[\"highway\"];"
-        "way[\"waterway\"][\"waterway\"!~\"^(drain|ditch)$\"];"
-        "way[\"natural\"=\"water\"];"
-        ");"
-        "out geom;",
-        s, w, n, e);
-}
-
-/* Synchronously fetch one tile from Overpass and write it to the disk
- * cache, then parse it into the layers. Returns 0 on success. */
-static int fetch_tile(OsmCache *cache, int x, int y)
-{
-    char query[1024];
-    build_query(x, y, query, sizeof(query));
-
-    /* Overpass accepts the query as POST body OR as ?data= url param.
-     * http.c only exposes GET, so we URL-encode into a query string. */
-    char url[4096];
-    /* Simple encode: spaces -> %20, others pass through (the query uses
-     * only ASCII punctuation that Overpass accepts verbatim, but to be
-     * safe encode the few troublesome chars). */
-    size_t ulen = snprintf(url, sizeof(url), "%s?data=", OVERPASS_URL);
-    for (size_t i = 0; query[i] && ulen + 4 < sizeof(url); i++) {
-        unsigned char c = (unsigned char)query[i];
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
-            url[ulen++] = (char)c;
+        if (nf.nrings > 0) {
+            geolayer_add(dst, nf);
         } else {
-            snprintf(url + ulen, sizeof(url) - ulen, "%%%02X", c);
-            ulen += 3;
+            free(nf.rings);
         }
     }
-    url[ulen] = '\0';
-
-    HttpBuffer buf = {0};
-    snprintf(cache->status, sizeof(cache->status),
-             "Fetching OSM tile %d/%d/%d...", OSM_TILE_Z, x, y);
-    if (http_get(url, &buf) != 0) {
-        http_buffer_free(&buf);
-        cache->last_error = 1;
-        snprintf(cache->status, sizeof(cache->status),
-                 "OSM fetch failed for %d/%d", x, y);
-        return -1;
-    }
-
-    /* Save to disk cache. */
-    char path[512];
-    tile_path(x, y, path, sizeof(path));
-    FILE *fp = fopen(path, "wb");
-    if (fp) {
-        fwrite(buf.data, 1, buf.size, fp);
-        fclose(fp);
-    }
-
-    /* Parse into layers. */
-    int rc = parse_tile_json(cache, buf.data, buf.size);
-    http_buffer_free(&buf);
-    if (rc == 0) {
-        snprintf(cache->status, sizeof(cache->status),
-                 "Loaded OSM tile %d/%d/%d", OSM_TILE_Z, x, y);
-    }
-    return rc;
 }
 
 /* ---------------------------------------------------------------------------
  * Public API.
- * -------------------------------------------------------------------------*/
+ * ---------------------------------------------------------------------*/
 
 void osm_init(OsmCache *cache)
 {
     memset(cache, 0, sizeof(*cache));
     for (int i = 0; i < OSM_LAYER_COUNT; i++) geolayer_init(&cache->layers[i]);
-    memset(g_tiles, 0, sizeof(g_tiles));
-    g_tile_count = 0;
+
+    if (g_mb) { mbtiles_close(g_mb); g_mb = NULL; }
+    for (int i = 0; i < g_lru_n; i++) tile_entry_free_layers(&g_lru[i]);
+    memset(g_lru, 0, sizeof(g_lru));
+    g_lru_n = 0;
+    g_lru_clock = 0;
+    g_vis_z = -1;
+
+    const char *path = resolve_mbtiles_path();
+    g_mb = mbtiles_open(path);
+    if (!g_mb) {
+        cache->mbtiles_ok = 0;
+        snprintf(cache->status, sizeof(cache->status),
+                 "No %s - zoom 6+ will be bare. Run tilemaker to generate.",
+                 path);
+        fprintf(stderr, "[osm] MBTiles file not found at %s; OSM detail disabled\n",
+                path);
+    } else {
+        cache->mbtiles_ok = 1;
+        snprintf(cache->status, sizeof(cache->status),
+                 "MBTiles loaded (z=%d..%d)",
+                 mbtiles_minzoom(g_mb), mbtiles_maxzoom(g_mb));
+    }
 }
 
 void osm_free(OsmCache *cache)
 {
     for (int i = 0; i < OSM_LAYER_COUNT; i++) geolayer_free(&cache->layers[i]);
     memset(cache, 0, sizeof(*cache));
-    memset(g_tiles, 0, sizeof(g_tiles));
-    g_tile_count = 0;
+
+    for (int i = 0; i < g_lru_n; i++) tile_entry_free_layers(&g_lru[i]);
+    memset(g_lru, 0, sizeof(g_lru));
+    g_lru_n = 0;
+
+    if (g_mb) { mbtiles_close(g_mb); g_mb = NULL; }
+}
+
+/* Convert viewport to z=14 tile range. We use geo.c's slippy-tile math
+ * directly — the map projection already matches. */
+static void viewport_tile_range(MapView *mv,
+                                int *x0, int *y0, int *x1, int *y1)
+{
+    double lat_tl, lon_tl, lat_br, lon_br;
+    map_screen_to_latlon(mv, 0, 0, &lat_tl, &lon_tl);
+    map_screen_to_latlon(mv, mv->screen_w - 1, mv->screen_h - 1, &lat_br, &lon_br);
+
+    /* Clamp lat to the Mercator domain. */
+    if (lat_tl >  85.0) lat_tl =  85.0;
+    if (lat_tl < -85.0) lat_tl = -85.0;
+    if (lat_br >  85.0) lat_br =  85.0;
+    if (lat_br < -85.0) lat_br = -85.0;
+
+    int ax, ay, bx, by;
+    geo_latlon_to_tile(lat_tl, lon_tl, OSM_TILE_Z, &ax, &ay);
+    geo_latlon_to_tile(lat_br, lon_br, OSM_TILE_Z, &bx, &by);
+
+    *x0 = ax < bx ? ax : bx;
+    *x1 = ax > bx ? ax : bx;
+    *y0 = ay < by ? ay : by;
+    *y1 = ay > by ? ay : by;
 }
 
 void osm_request_viewport(OsmCache *cache, MapView *mv)
 {
-    /* Only at zoom where OSM detail actually helps. Below zoom 9 the tile
-     * grid gets absurd and Natural Earth still looks fine. */
-    if (mv->zoom < 9) return;
-
-    /* Determine viewport lat/lon bbox (reuses the map's projection math). */
-    double lat_tl, lon_tl, lat_br, lon_br;
-    map_screen_to_latlon(mv, 0, 0, &lat_tl, &lon_tl);
-    map_screen_to_latlon(mv, mv->screen_w - 1, mv->screen_h - 1, &lat_br, &lon_br);
-    double lat_min = lat_tl < lat_br ? lat_tl : lat_br;
-    double lat_max = lat_tl > lat_br ? lat_tl : lat_br;
-    double lon_min = lon_tl < lon_br ? lon_tl : lon_br;
-    double lon_max = lon_tl > lon_br ? lon_tl : lon_br;
+    if (!g_mb) return;                        /* file missing — nothing to do */
+    if (mv->zoom < OSM_MIN_TILE_ZOOM) {
+        /* Too far out for detailed tiles. Clear any stale features. */
+        if (g_vis_z != -1) {
+            for (int i = 0; i < OSM_LAYER_COUNT; i++) geolayer_free(&cache->layers[i]);
+            g_vis_z = -1;
+        }
+        return;
+    }
 
     int x0, y0, x1, y1;
-    latlon_to_tile(lat_max, lon_min, &x0, &y0);
-    latlon_to_tile(lat_min, lon_max, &x1, &y1);
-    if (x1 < x0) { int t = x0; x0 = x1; x1 = t; }
-    if (y1 < y0) { int t = y0; y0 = y1; y1 = t; }
+    viewport_tile_range(mv, &x0, &y0, &x1, &y1);
 
-    /* Cap the tile request rectangle to avoid asking for hundreds of tiles
-     * if the viewport somehow covers a huge area at zoom 9. */
-    int tiles = (x1 - x0 + 1) * (y1 - y0 + 1);
-    if (tiles > 32) return; /* too wide — skip until user zooms in */
+    /* Hard safety cap. At zoom 6 a world-scale view could in principle
+     * cover thousands of z=14 tiles — refuse to try. This is the same
+     * tile-count guard we used to have for Overpass, but a much higher
+     * ceiling since local reads are cheap. */
+    int tiles_wide = x1 - x0 + 1;
+    int tiles_tall = y1 - y0 + 1;
+    long ntiles = (long)tiles_wide * (long)tiles_tall;
+    if (ntiles > 2048) {
+        /* Shrink around the center to at most ~2048 tiles. */
+        int cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+        int half = 22;                        /* ~44x44 = 1936 tiles */
+        x0 = cx - half; x1 = cx + half;
+        y0 = cy - half; y1 = cy + half;
+        tiles_wide = x1 - x0 + 1;
+        tiles_tall = y1 - y0 + 1;
+        ntiles = (long)tiles_wide * (long)tiles_tall;
+    }
 
-    int pending = 0;
-    for (int x = x0; x <= x1; x++) {
-        for (int y = y0; y <= y1; y++) {
-            int idx = tile_find(x, y);
-            if (idx >= 0) {
-                if (g_tiles[idx].status == TS_PENDING) pending++;
-                continue;
-            }
-            /* First sighting of this tile. Check disk cache. */
-            char path[512];
-            tile_path(x, y, path, sizeof(path));
-            if (file_exists(path)) {
-                if (load_cached_tile(cache, path) == 0) {
-                    tile_add(x, y, TS_LOADED);
-                } else {
-                    tile_add(x, y, TS_FAILED);
-                }
-            } else {
-                tile_add(x, y, TS_PENDING);
-                pending++;
+    /* Skip rebuild if the visible set hasn't changed. */
+    if (g_vis_z == OSM_TILE_Z &&
+        g_vis_x0 == x0 && g_vis_x1 == x1 &&
+        g_vis_y0 == y0 && g_vis_y1 == y1) {
+        return;
+    }
+    g_vis_z  = OSM_TILE_Z;
+    g_vis_x0 = x0; g_vis_x1 = x1;
+    g_vis_y0 = y0; g_vis_y1 = y1;
+
+    /* Rebuild cache->layers from the visible tile set. */
+    for (int i = 0; i < OSM_LAYER_COUNT; i++) geolayer_free(&cache->layers[i]);
+
+    int loaded = 0, missed = 0;
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            TileEntry *te = load_tile(OSM_TILE_Z, x, y);
+            if (!te) { missed++; continue; }
+            loaded++;
+            for (int l = 0; l < OSM_LAYER_COUNT; l++) {
+                layer_append_copy(&cache->layers[l], &te->layers[l]);
             }
         }
     }
-    cache->tiles_pending = pending;
+
+    snprintf(cache->status, sizeof(cache->status),
+             "OSM: %d tiles (%ldx%ld) %s",
+             loaded, (long)tiles_wide, (long)tiles_tall,
+             missed ? "(some missing)" : "");
 }
 
-int osm_tick(OsmCache *cache)
-{
-    /* Fetch at most one pending tile per call to stay responsive. */
-    for (int i = 0; i < g_tile_count; i++) {
-        if (g_tiles[i].status == TS_PENDING) {
-            int x = g_tiles[i].x, y = g_tiles[i].y;
-            int rc = fetch_tile(cache, x, y);
-            g_tiles[i].status = (rc == 0) ? TS_LOADED : TS_FAILED;
-            /* Recount pending. */
-            int p = 0;
-            for (int j = 0; j < g_tile_count; j++)
-                if (g_tiles[j].status == TS_PENDING) p++;
-            cache->tiles_pending = p;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-int osm_is_busy(OsmCache *cache) { return cache->tiles_pending > 0; }
+int osm_tick(OsmCache *cache) { (void)cache; return 0; }
+int osm_is_busy(OsmCache *cache) { (void)cache; return 0; }
