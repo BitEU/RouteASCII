@@ -34,7 +34,6 @@ routeascii/
 | Library   | Purpose                | Windows           | Linux/macOS       |
 |-----------|------------------------|--------------------|--------------------|
 | PDCurses  | TUI rendering          | included / vcpkg  | n/a (use ncurses)  |
-| ncurses   | TUI rendering          | n/a                | apt / brew          |
 | libcurl   | HTTP requests          | vcpkg / prebuilt   | apt / brew          |
 | cJSON     | JSON parsing           | bundled (single-file) | bundled          |
 

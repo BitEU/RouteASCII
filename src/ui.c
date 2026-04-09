@@ -1,3 +1,4 @@
+#define _MAP_NEEDS_CURSES
 #include "ui.h"
 #include <string.h>
 #include <stdio.h>

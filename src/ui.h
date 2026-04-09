@@ -1,6 +1,7 @@
 #ifndef UI_H
 #define UI_H
 
+#define _MAP_NEEDS_CURSES
 #include <curses.h>
 #include "map.h"
 #include "route.h"

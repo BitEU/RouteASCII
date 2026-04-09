@@ -1,3 +1,4 @@
+#define _MAP_NEEDS_CURSES
 #include "map.h"
 #include "geo.h"
 #include <math.h>

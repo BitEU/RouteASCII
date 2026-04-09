@@ -1,7 +1,14 @@
 #ifndef MAP_H
 #define MAP_H
 
+#ifdef _MAP_NEEDS_CURSES
 #include <curses.h>
+#endif
+
+/* Forward declare WINDOW if curses not included */
+#ifndef _MAP_NEEDS_CURSES
+typedef void WINDOW;
+#endif
 
 /* Map viewport state */
 typedef struct {

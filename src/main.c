@@ -3,6 +3,7 @@
 #include <string.h>
 #include <signal.h>
 
+#define _MAP_NEEDS_CURSES
 #include "http.h"
 #include "geo.h"
 #include "map.h"
