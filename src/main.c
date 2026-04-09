@@ -30,19 +30,27 @@ int main(int argc, char *argv[])
      * the TUI and then get wiped on the next redraw. Line-buffer so tail
      * -f works and so crashes flush everything written so far. */
     FILE *logf = freopen("console.log", "w", stderr);
-    if (logf) setvbuf(logf, NULL, _IOLBF, 0);
+    if (logf) setvbuf(logf, NULL, _IONBF, 0);
+    fprintf(stderr, "[main] entered\n"); fflush(stderr);
 
     /* Initialize subsystems */
+    fprintf(stderr, "[main] http_init\n"); fflush(stderr);
     http_init();
+    fprintf(stderr, "[main] http_init done\n");
 
+    fprintf(stderr, "[main] ui_init\n");
     UIState ui;
     ui_init(&ui);
+    fprintf(stderr, "[main] ui_init done\n");
 
+    fprintf(stderr, "[main] map_init\n");
     MapView mv;
     map_init(&mv);
+    fprintf(stderr, "[main] map_init done\n");
 
     RouteOverlay overlay;
     route_overlay_init(&overlay);
+    fprintf(stderr, "[main] overlay init done\n");
 
     RouteResult route_result;
     memset(&route_result, 0, sizeof(route_result));
