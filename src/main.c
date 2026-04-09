@@ -25,6 +25,13 @@ int main(int argc, char *argv[])
     (void)argc;
     (void)argv;
 
+    /* Redirect stderr to console.log before curses takes the terminal.
+     * Without this, all the [geodata]/[osm] fprintf lines scribble over
+     * the TUI and then get wiped on the next redraw. Line-buffer so tail
+     * -f works and so crashes flush everything written so far. */
+    FILE *logf = freopen("console.log", "w", stderr);
+    if (logf) setvbuf(logf, NULL, _IOLBF, 0);
+
     /* Initialize subsystems */
     http_init();
 
@@ -234,7 +241,17 @@ int main(int argc, char *argv[])
 #endif
 
         case ERR:
-            /* Timeout — no key pressed, just re-render */
+            /* Timeout — drive background work (e.g. OSM tile fetches).
+             * If something changed, surface the status in the status bar
+             * so the user sees what's happening. */
+            map_tick();
+            {
+                const char *ms = map_status();
+                if (ms && *ms) {
+                    strncpy(status_msg, ms, sizeof(status_msg) - 1);
+                    status_msg[sizeof(status_msg) - 1] = '\0';
+                }
+            }
             break;
 
         default:

@@ -21,6 +21,13 @@ typedef struct {
     int use_slope;   /* if non-zero, pick - | / \ from segment direction */
 } LayerStyle;
 
+/* Frame lifecycle. Call begin before any render_* calls, end after the
+ * fills are done but before markers/labels — end flushes the braille
+ * canvas onto the window. */
+void render_begin_frame(WINDOW *win);
+void render_end_frame(WINDOW *win);
+void render_shutdown(void);
+
 /* Clear the window to the water/background character. */
 void render_clear_water(WINDOW *win);
 

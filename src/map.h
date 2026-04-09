@@ -42,6 +42,13 @@ void map_init(MapView *mv);
 /* Free all cached vector data. Call once at program exit. */
 void map_shutdown(void);
 
+/* Drive background work — fetches one OSM tile from the queue if any.
+ * Returns 1 if something changed and the caller should re-render. */
+int map_tick(void);
+
+/* Human-readable status from the background work (e.g. "Fetching OSM..."). */
+const char *map_status(void);
+
 /* Render the ASCII map into the given curses window.
    If overlay is non-NULL and has_route, draw the route on top. */
 void map_render(WINDOW *win, MapView *mv, RouteOverlay *overlay);

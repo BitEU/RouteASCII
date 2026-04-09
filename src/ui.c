@@ -2,11 +2,16 @@
 #include "ui.h"
 #include <string.h>
 #include <stdio.h>
+#include <locale.h>
 
 #define SIDEBAR_WIDTH 36
 
 void ui_init(UIState *ui)
 {
+    /* Enable the user's locale so ncursesw / PDCurses can render UTF-8
+     * braille glyphs used by the subpixel canvas. No-op if already set. */
+    setlocale(LC_ALL, "");
+
     initscr();
     cbreak();
     noecho();

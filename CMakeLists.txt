@@ -11,6 +11,8 @@ set(SOURCES
     src/geo.c
     src/geodata.c
     src/render.c
+    src/subpixel.c
+    src/osm.c
     src/map.c
     src/route.c
     src/ui.c

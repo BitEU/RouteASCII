@@ -3,6 +3,7 @@
 #include "geo.h"
 #include "geodata.h"
 #include "render.h"
+#include "osm.h"
 #include "ui.h"
 
 #include <math.h>
@@ -24,6 +25,9 @@
 static GeoDataset g_dataset;
 static int        g_dataset_initialized = 0;
 
+static OsmCache   g_osm;
+static int        g_osm_initialized = 0;
+
 static void ensure_dataset(MapView *mv)
 {
     if (!g_dataset_initialized) {
@@ -39,9 +43,13 @@ static void ensure_dataset(MapView *mv)
     if (mv->zoom >= 5 && !g_dataset.lod_loaded[LOD_50M]) {
         geodata_ensure_lod(&g_dataset, LOD_50M);
     }
-    /* LOD_10M is intentionally NOT auto-loaded. It's ~100MB and would block
-     * the render thread long enough to look like a freeze. A future
-     * background-loader thread can upgrade to 10m without blocking input. */
+    /* LOD_10M is ~100MB and loads in ~10-20s the first time — one long
+     * pause, but without it zoom 8+ is basically empty (NE 50m has zero
+     * local road detail and coastlines are still very coarse). Worth the
+     * wait. Subsequent runs load from disk cache in ~1-2s. */
+    if (mv->zoom >= 8 && !g_dataset.lod_loaded[LOD_10M]) {
+        geodata_ensure_lod(&g_dataset, LOD_10M);
+    }
 }
 
 void map_init(MapView *mv)
@@ -69,6 +77,9 @@ void map_render(WINDOW *win, MapView *mv, RouteOverlay *overlay)
             if (g_dataset.lod_loaded[l]) { lod = (GeoLod)l; break; }
         }
     }
+
+    /* Begin a frame — resets the braille canvas used for all strokes. */
+    render_begin_frame(win);
 
     /* --- 1. Clear to water --- */
     render_clear_water(win);
@@ -118,11 +129,53 @@ void map_render(WINDOW *win, MapView *mv, RouteOverlay *overlay)
     };
     render_line_layer(win, mv, &g_dataset.layers[lod][LAYER_COASTLINE], &coast_style);
 
-    /* --- 9. OSRM route overlay --- */
+    /* --- 7b. OSM vector detail at high zoom ---
+     * At zoom 9+ we overlay real OSM road networks, waterways, and
+     * waterbodies fetched from Overpass. Tiles are loaded lazily in the
+     * main loop via map_tick(); this call only requests coverage for the
+     * current viewport and renders whatever has already been fetched. */
+    if (mv->zoom >= 9) {
+        if (!g_osm_initialized) { osm_init(&g_osm); g_osm_initialized = 1; }
+        osm_request_viewport(&g_osm, mv);
+
+        LayerStyle osm_water = {
+            .cp = CP_WATER, .attr = 0,
+            .fill_ch = 0,   .stroke_ch = '~', .use_slope = 0
+        };
+        render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_WATER], &osm_water);
+
+        LayerStyle osm_waterway = {
+            .cp = CP_WATER, .attr = A_DIM,
+            .fill_ch = 0,   .stroke_ch = '~', .use_slope = 0
+        };
+        render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_WATERWAY], &osm_waterway);
+
+        LayerStyle osm_road_minor = {
+            .cp = CP_GRID,  .attr = A_DIM,
+            .fill_ch = 0,   .stroke_ch = '-', .use_slope = 0
+        };
+        render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_MINOR], &osm_road_minor);
+
+        LayerStyle osm_road_major = {
+            .cp = CP_BORDER, .attr = A_BOLD,
+            .fill_ch = 0,    .stroke_ch = '=', .use_slope = 0
+        };
+        render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_MAJOR], &osm_road_major);
+    }
+
+    /* --- 9. OSRM route overlay (drawn into braille canvas too) --- */
     if (overlay && overlay->has_route && overlay->count > 0) {
         render_polyline_points(win, mv, overlay->points, overlay->count,
                                '*', CP_ROUTE, A_BOLD);
+    }
 
+    /* Flush all stroke dots from the braille canvas onto the window,
+     * overlaying the fills we drew above. */
+    render_end_frame(win);
+
+    /* --- 10. Origin/dest markers and cities drawn AFTER braille flush
+     * so their text glyphs sit on top of coastlines and route lines. --- */
+    if (overlay && overlay->has_route && overlay->count > 0) {
         int sc, sr;
         if (map_latlon_to_screen(mv, overlay->orig_lat, overlay->orig_lon,
                                  &sc, &sr)) {
@@ -134,7 +187,6 @@ void map_render(WINDOW *win, MapView *mv, RouteOverlay *overlay)
         }
     }
 
-    /* --- 10. Cities (on top of everything except route markers) --- */
     render_places_layer(win, mv, &g_dataset.layers[lod][LAYER_POP_PLACES]);
 
     wrefresh(win);
@@ -149,10 +201,11 @@ static void screen_cell_to_latlon(MapView *mv, int col, int row,
     geo_latlon_to_pixel(mv->center_lat, mv->center_lon, mv->zoom,
                         &center_px, &center_py);
 
-    double scale = 256.0 / (double)(1 << (18 - mv->zoom));
-    if (scale < 1.0) scale = 1.0;
-    double char_w = scale * 2.0;
-    double char_h = scale * 4.0;
+    /* One cell = 2 sub-pixels wide × 4 sub-pixels tall. World pixels from
+     * geo_latlon_to_pixel already scale with 2^zoom — we must NOT scale
+     * char_w with zoom too, or the two cancel and zooming stops working. */
+    double char_w = 2.0;
+    double char_h = 4.0;
 
     double px = center_px + (col - mv->screen_w / 2.0) * char_w;
     double py = center_py + (row - mv->screen_h / 2.0) * char_h;
@@ -204,10 +257,8 @@ int map_latlon_to_screen(MapView *mv, double lat, double lon, int *col, int *row
     double pt_px, pt_py;
     geo_latlon_to_pixel(lat, lon, mv->zoom, &pt_px, &pt_py);
 
-    double scale = 256.0 / (double)(1 << (18 - mv->zoom));
-    if (scale < 1.0) scale = 1.0;
-    double char_w = scale * 2.0;
-    double char_h = scale * 4.0;
+    double char_w = 2.0;
+    double char_h = 4.0;
 
     *col = (int)(mv->screen_w / 2.0 + (pt_px - center_px) / char_w);
     *row = (int)(mv->screen_h / 2.0 + (pt_py - center_py) / char_h);
@@ -254,4 +305,27 @@ void map_shutdown(void)
         geodata_free(&g_dataset);
         g_dataset_initialized = 0;
     }
+    if (g_osm_initialized) {
+        osm_free(&g_osm);
+        g_osm_initialized = 0;
+    }
+    render_shutdown();
+}
+
+int map_tick(void)
+{
+    if (!g_osm_initialized) return 0;
+    return osm_tick(&g_osm);
+}
+
+const char *map_status(void)
+{
+    if (!g_osm_initialized) return "";
+    /* One-shot: reading the status also clears it so it doesn't stick in
+     * the status bar forever after a tile finishes loading. */
+    static char buf[128];
+    strncpy(buf, g_osm.status, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    g_osm.status[0] = '\0';
+    return buf;
 }

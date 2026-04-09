@@ -4,7 +4,9 @@
   "description": "ASCII TUI route plotter using curses and libcurl",
   "dependencies": [
     "curl",
-    "pdcurses"
+    "pdcurses",
+    "sqlite3",
+    "zlib"
   ],
   "builtin-baseline": "baababd134e882ca22d7432a915fc6feae882ce0"
 }

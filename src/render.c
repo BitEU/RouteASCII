@@ -1,11 +1,32 @@
 #include "render.h"
 #include "geo.h"
 #include "ui.h"
+#include "subpixel.h"
 
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
+/* Module-owned braille canvas for all stroke primitives. */
+static BrailleCanvas g_bc;
+
+void render_begin_frame(WINDOW *win)
+{
+    int mx, my;
+    getmaxyx(win, my, mx);
+    bc_resize(&g_bc, mx, my);
+}
+
+void render_end_frame(WINDOW *win)
+{
+    bc_flush(&g_bc, win);
+}
+
+void render_shutdown(void)
+{
+    bc_free(&g_bc);
+}
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -15,14 +36,18 @@
  * Projection helpers. MapView stores a center (lat,lon) + zoom; we want
  * cell-space (col,row) coords for any (lat,lon) consistently with map.c.
  *
- * Formula (mirrors map.c):
- *   global_px(lat,lon,zoom) via geo_latlon_to_pixel()
- *   scale = 256 / (1 << (18 - zoom))
- *   char_w = scale * 2
- *   char_h = scale * 4
- *   col = screen_w/2 + (px - center_px)/char_w
- *   row = screen_h/2 + (py - center_py)/char_h
+ * One character cell = 2 sub-pixels wide × 4 sub-pixels tall (braille).
+ * World-pixel coordinates from geo_latlon_to_pixel() already scale with
+ * 2^zoom, so char_w / char_h are simply constants — they define how many
+ * Mercator "world pixels" fit into one screen cell, not how we scale zoom.
+ *
+ * (The previous code multiplied char_w by 2^(zoom-9), which perfectly
+ * cancelled the zoom growth in the numerator — every zoom level above 10
+ * rendered identically. That's why zoom 10 and zoom 16 looked the same.)
  * -------------------------------------------------------------------------*/
+
+#define CELL_SUBPX_W 2.0
+#define CELL_SUBPX_H 4.0
 
 typedef struct {
     double center_px, center_py;
@@ -35,10 +60,8 @@ static void projector_init(Projector *p, MapView *mv, double lon_offset)
 {
     geo_latlon_to_pixel(mv->center_lat, mv->center_lon, mv->zoom,
                         &p->center_px, &p->center_py);
-    double scale = 256.0 / (double)(1 << (18 - mv->zoom));
-    if (scale < 1.0) scale = 1.0;
-    p->char_w = scale * 2.0;
-    p->char_h = scale * 4.0;
+    p->char_w = CELL_SUBPX_W;
+    p->char_h = CELL_SUBPX_H;
     p->sw = mv->screen_w;
     p->sh = mv->screen_h;
     p->lon_offset = lon_offset;
@@ -65,9 +88,7 @@ static void viewport_bbox(MapView *mv, double lon_offset, GeoBBox *out)
     double center_px, center_py;
     geo_latlon_to_pixel(mv->center_lat, mv->center_lon, mv->zoom,
                         &center_px, &center_py);
-    double scale = 256.0 / (double)(1 << (18 - mv->zoom));
-    if (scale < 1.0) scale = 1.0;
-    double char_w = scale * 2.0, char_h = scale * 4.0;
+    double char_w = CELL_SUBPX_W, char_h = CELL_SUBPX_H;
 
     double px_l = center_px + (0            - mv->screen_w / 2.0) * char_w;
     double px_r = center_px + (mv->screen_w - mv->screen_w / 2.0) * char_w;
@@ -158,40 +179,12 @@ static int clip_line(double *x0, double *y0, double *x1, double *y1,
 }
 
 /* ---------------------------------------------------------------------------
- * Bresenham line with character picked from slope. Endpoints already clipped.
+ * Stroke rendering is now routed through the braille canvas at subpixel
+ * (2x4 per cell) resolution. Line primitives take *cell-space* float coords
+ * (as produced by the projector), scale up to pixel space, clip, and call
+ * bc_line. The old character-mode draw_line / slope-aware glyph picking is
+ * gone — braille dots look dramatically better at every zoom level.
  * -------------------------------------------------------------------------*/
-static void draw_line(WINDOW *win, int x0, int y0, int x1, int y1,
-                      const LayerStyle *style)
-{
-    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-
-    int ch = style->stroke_ch;
-    if (style->use_slope) {
-        int adx = abs(x1 - x0), ady = abs(y1 - y0);
-        if (ady * 3 < adx)            ch = '-';
-        else if (adx * 3 < ady)       ch = '|';
-        else if ((sx == sy))          ch = '\\';
-        else                          ch = '/';
-    }
-
-    /* Guard against runaway loops for absurdly long lines clipped far off
-     * screen — cap iteration count. */
-    int mx, my;
-    getmaxyx(win, my, mx);
-    int cap = (mx + my) * 8;
-    int steps = 0;
-
-    for (;;) {
-        put_cell(win, x0, y0, ch, style->cp, style->attr);
-        if (x0 == x1 && y0 == y1) break;
-        if (++steps > cap) break;
-        int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
-    }
-}
 
 /* ---------------------------------------------------------------------------
  * Polygon scanline fill. Collects edges from all rings of the feature,
@@ -304,21 +297,24 @@ static void fill_feature(WINDOW *win, MapView *mv, const Projector *p,
     free(edges);
 }
 
-/* Draw a clipped segment in projected cell space. ax/ay/bx/by are float
- * cell coords; we clip to the window then round and Bresenham. */
+/* Draw a clipped segment. ax/ay/bx/by are float *cell* coords from the
+ * projector. We scale to pixel coords (×2, ×4), clip against the braille
+ * canvas pixel bounds, round, and call bc_line. */
 static void draw_segment_clipped(WINDOW *win, double ax, double ay,
                                  double bx, double by,
                                  const LayerStyle *style)
 {
-    int mx, my;
-    getmaxyx(win, my, mx);
-    double x0 = ax, y0 = ay, x1 = bx, y1 = by;
+    (void)win;
+    if (!g_bc.dots) return;
+    double x0 = ax * 2.0, y0 = ay * 4.0;
+    double x1 = bx * 2.0, y1 = by * 4.0;
     if (!clip_line(&x0, &y0, &x1, &y1,
-                   0.0, 0.0, (double)(mx - 1), (double)(my - 1)))
+                   0.0, 0.0,
+                   (double)(g_bc.pw - 1), (double)(g_bc.ph - 1)))
         return;
     int ix0 = (int)lround(x0), iy0 = (int)lround(y0);
     int ix1 = (int)lround(x1), iy1 = (int)lround(y1);
-    draw_line(win, ix0, iy0, ix1, iy1, style);
+    bc_line(&g_bc, ix0, iy0, ix1, iy1, style->cp, style->attr);
 }
 
 static void stroke_feature(WINDOW *win, MapView *mv, const Projector *p,
@@ -330,19 +326,20 @@ static void stroke_feature(WINDOW *win, MapView *mv, const Projector *p,
         double px, py, qx, qy;
         project_at(mv, p, ring->coords[1], ring->coords[0], &px, &py);
         double prev_x = px, prev_y = py;
-        int prev_ix = (int)lround(px), prev_iy = (int)lround(py);
+        /* Decimate in pixel space: skip segments that start and end in the
+         * same braille dot. At high zoom nothing gets skipped; at low zoom
+         * this throws away a ton of sub-dot noise from oversampled data. */
+        int prev_px = (int)lround(px * 2.0), prev_py = (int)lround(py * 4.0);
         for (int i = 1; i < ring->npoints; i++) {
             project_at(mv, p,
                        ring->coords[i * 2 + 1], ring->coords[i * 2],
                        &qx, &qy);
-            int cix = (int)lround(qx), ciy = (int)lround(qy);
-            /* Skip degenerate same-cell segments — common at low zoom
-             * when high-res data oversamples. */
-            if (cix != prev_ix || ciy != prev_iy) {
+            int cpx = (int)lround(qx * 2.0), cpy = (int)lround(qy * 4.0);
+            if (cpx != prev_px || cpy != prev_py) {
                 draw_segment_clipped(win, prev_x, prev_y, qx, qy, style);
+                prev_x = qx; prev_y = qy;
+                prev_px = cpx; prev_py = cpy;
             }
-            prev_x = qx; prev_y = qy;
-            prev_ix = cix; prev_iy = ciy;
         }
     }
 }
@@ -375,9 +372,7 @@ void render_graticule(WINDOW *win, MapView *mv)
     double center_px, center_py;
     geo_latlon_to_pixel(mv->center_lat, mv->center_lon, mv->zoom,
                         &center_px, &center_py);
-    double scale = 256.0 / (double)(1 << (18 - mv->zoom));
-    if (scale < 1.0) scale = 1.0;
-    double char_w = scale * 2.0, char_h = scale * 4.0;
+    double char_w = CELL_SUBPX_W, char_h = CELL_SUBPX_H;
     int n = 1 << mv->zoom;
 
     /* Grid step grows with zoom-out to keep lines visible. */
@@ -470,6 +465,15 @@ void render_line_layer(WINDOW *win, MapView *mv, const GeoLayer *layer,
     }
 }
 
+/* Sort features by rank ascending so more prominent cities are drawn first
+ * and win the label-collision arbitration. */
+static int place_cmp(const void *a, const void *b)
+{
+    const GeoFeature *fa = *(const GeoFeature * const *)a;
+    const GeoFeature *fb = *(const GeoFeature * const *)b;
+    return fa->rank - fb->rank;
+}
+
 void render_places_layer(WINDOW *win, MapView *mv, const GeoLayer *layer)
 {
     if (!layer || layer->nfeatures == 0) return;
@@ -484,39 +488,75 @@ void render_places_layer(WINDOW *win, MapView *mv, const GeoLayer *layer)
     else if (mv->zoom <= 10) rank_cutoff = 8;
     else                     rank_cutoff = 20;
 
+    /* Gather visible candidates into a pointer array, then sort by rank so
+     * big cities claim their labels first. */
+    int cap = layer->nfeatures;
+    const GeoFeature **cand = malloc((size_t)cap * sizeof(GeoFeature*));
+    if (!cand) return;
+    int nc = 0;
     for (int i = 0; i < layer->nfeatures; i++) {
         const GeoFeature *f = &layer->features[i];
         if (f->type != GEOM_POINT) continue;
         if (f->rank > rank_cutoff) continue;
         if (!bbox_intersects(&f->bbox, &vb)) continue;
+        cand[nc++] = f;
+    }
+    qsort(cand, (size_t)nc, sizeof(GeoFeature*), place_cmp);
 
+    /* Label occupancy bitmap — one bit per cell, set as labels are placed.
+     * Lets us drop a label whose cells overlap an existing one. */
+    int mx, my;
+    getmaxyx(win, my, mx);
+    int occ_sz = mx * my;
+    unsigned char *occ = calloc((size_t)occ_sz, 1);
+    if (!occ) { free(cand); return; }
+
+    for (int k = 0; k < nc; k++) {
+        const GeoFeature *f = cand[k];
         double cx, cy;
         project_at(mv, &p, f->rings[0].coords[1], f->rings[0].coords[0],
                    &cx, &cy);
         int x = (int)lround(cx), y = (int)lround(cy);
+        if (x < 0 || y < 0 || x >= mx || y >= my) continue;
 
+        /* Marker — scale with rank so NYC > Phoenix > Akron visually. */
         int ch;
-        if      (f->rank <= 1) ch = '@';
-        else if (f->rank <= 4) ch = 'O';
-        else if (f->rank <= 7) ch = 'o';
-        else                    ch = '.';
-        put_cell(win, x, y, ch, CP_MARKER, A_BOLD);
+        int attr = A_BOLD;
+        if      (f->rank <= 1) { ch = '@'; }
+        else if (f->rank <= 3) { ch = 'O'; }
+        else if (f->rank <= 6) { ch = 'o'; }
+        else                   { ch = '.'; attr = 0; }
+        put_cell(win, x, y, ch, CP_MARKER, attr);
+        occ[y * mx + x] = 1;
 
-        /* Label the city at mid zoom if there's room. */
-        if (mv->zoom >= 5 && f->name[0]) {
-            int mx, my;
-            getmaxyx(win, my, mx);
-            int lx = x + 1;
-            if (lx < mx - 1 && y >= 0 && y < my) {
-                for (int k = 0; f->name[k] && lx < mx - 1; k++, lx++) {
-                    if (lx == mx - 1 && y == my - 1) break;
-                    mvwaddch(win, y, lx,
-                             (chtype)(unsigned char)f->name[k] |
-                             COLOR_PAIR(CP_MARKER));
-                }
+        /* Label. Only attempt at mid+ zoom. */
+        if (mv->zoom < 5 || !f->name[0]) continue;
+        int name_len = (int)strlen(f->name);
+        /* Try placing label to the right first, then left, then below. */
+        int tries[3][2] = { {x + 2, y}, {x - name_len - 1, y}, {x + 2, y + 1} };
+        for (int t = 0; t < 3; t++) {
+            int lx = tries[t][0], ly = tries[t][1];
+            if (ly < 0 || ly >= my) continue;
+            if (lx < 0 || lx + name_len >= mx - 1) continue;
+            int clash = 0;
+            for (int q = 0; q < name_len; q++) {
+                if (occ[ly * mx + (lx + q)]) { clash = 1; break; }
             }
+            if (clash) continue;
+            /* Place it. */
+            for (int q = 0; q < name_len; q++) {
+                int cx2 = lx + q;
+                if (cx2 == mx - 1 && ly == my - 1) break;
+                mvwaddch(win, ly, cx2,
+                         (chtype)(unsigned char)f->name[q] |
+                         COLOR_PAIR(CP_MARKER));
+                occ[ly * mx + cx2] = 1;
+            }
+            break;
         }
     }
+    free(occ);
+    free(cand);
 }
 
 void render_polyline_points(WINDOW *win, MapView *mv,
