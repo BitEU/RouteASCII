@@ -1,0 +1,29 @@
+CC      = gcc
+CFLAGS  = -Wall -Wextra -std=c11 -O2 -DPDC_WIDE
+LDFLAGS = -lpdcurses -lcurl -lws2_32 -lm
+
+SRCDIR  = src
+OBJDIR  = obj
+BINDIR  = .
+
+SOURCES = $(wildcard $(SRCDIR)/*.c)
+OBJECTS = $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SOURCES))
+TARGET  = $(BINDIR)/routeascii.exe
+
+.PHONY: all clean
+
+all: $(OBJDIR) $(TARGET)
+
+$(OBJDIR):
+	if not exist $(OBJDIR) mkdir $(OBJDIR)
+
+$(TARGET): $(OBJECTS)
+	$(CC) $(OBJECTS) -o $(TARGET) $(LDFLAGS)
+	@echo Build complete: $(TARGET)
+
+$(OBJDIR)/%.o: $(SRCDIR)/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	if exist $(OBJDIR) rmdir /s /q $(OBJDIR)
+	if exist $(TARGET) del $(TARGET)
