@@ -10,6 +10,7 @@ struct Mbtiles {
     sqlite3_stmt *get_stmt;
     int           minzoom;
     int           maxzoom;
+    int           y_mode;   /* -1 unknown, 0 xyz row, 1 tms row */
 };
 
 /* Read a metadata value by name. Returns malloc'd string or NULL. */
@@ -68,6 +69,7 @@ Mbtiles *mbtiles_open(const char *path)
     m->db = db;
     m->minzoom = -1;
     m->maxzoom = -1;
+    m->y_mode = -1;
 
     /* Prepare the hot query once and reuse. */
     const char *sql =
@@ -121,18 +123,41 @@ int mbtiles_get_tile(Mbtiles *m, int z, int x, int y,
     if (out_size) *out_size = 0;
     if (!m || !m->get_stmt) return -1;
 
-    /* Planetiler writes XYZ-convention tile_row values, so no Y-flip
-     * is needed. Traditional TMS-convention mbtiles (e.g. from
-     * tilemaker) would need: tms_y = ((1 << z) - 1) - y; but our
-     * tiles come from planetiler which stores Y directly. */
+    int y_xyz = y;
+    int y_tms = ((1 << z) - 1) - y;
 
-    sqlite3_reset(m->get_stmt);
-    sqlite3_clear_bindings(m->get_stmt);
-    sqlite3_bind_int(m->get_stmt, 1, z);
-    sqlite3_bind_int(m->get_stmt, 2, x);
-    sqlite3_bind_int(m->get_stmt, 3, y);
+    int y_query[2];
+    int attempts = 0;
 
-    int rc = sqlite3_step(m->get_stmt);
+    if (m->y_mode == 0) {
+        y_query[attempts++] = y_xyz;
+    } else if (m->y_mode == 1) {
+        y_query[attempts++] = y_tms;
+    } else {
+        /* Unknown convention: MBTiles spec is TMS, probe that first,
+         * then fall back to XYZ for non-standard files. */
+        y_query[attempts++] = y_tms;
+        y_query[attempts++] = y_xyz;
+    }
+
+    int rc = SQLITE_DONE;
+    for (int i = 0; i < attempts; i++) {
+        sqlite3_reset(m->get_stmt);
+        sqlite3_clear_bindings(m->get_stmt);
+        sqlite3_bind_int(m->get_stmt, 1, z);
+        sqlite3_bind_int(m->get_stmt, 2, x);
+        sqlite3_bind_int(m->get_stmt, 3, y_query[i]);
+
+        rc = sqlite3_step(m->get_stmt);
+        if (rc == SQLITE_ROW) {
+            if (m->y_mode < 0) {
+                m->y_mode = (y_query[i] == y_tms) ? 1 : 0;
+                fprintf(stderr, "[mbtiles] detected tile_row mode: %s\n",
+                        m->y_mode ? "TMS (Y-flipped)" : "XYZ");
+            }
+            break;
+        }
+    }
     if (rc != SQLITE_ROW) return -1;
 
     const void *blob = sqlite3_column_blob(m->get_stmt, 0);
