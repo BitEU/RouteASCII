@@ -119,10 +119,10 @@ void map_render(WINDOW *win, MapView *mv, RouteOverlay *overlay)
 
     ensure_dataset(mv);
     GeoLod lod = geodata_lod_for_zoom(mv->zoom);
-    /* If the requested LOD failed to load (no network, say), fall back to
-     * whatever we do have. */
+    /* If the requested LOD isn't loaded yet (e.g. 10m loading in
+     * background), fall back to the best available — scan downward. */
     if (!g_dataset.lod_loaded[lod]) {
-        for (int l = 0; l < LOD_COUNT; l++) {
+        for (int l = lod - 1; l >= 0; l--) {
             if (g_dataset.lod_loaded[l]) { lod = (GeoLod)l; break; }
         }
     }

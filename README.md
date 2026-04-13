@@ -150,6 +150,7 @@ cmake --build build --config Release
 
 1. Download Windows tilemaker from https://github.com/systemed/tilemaker/releases
 2. Run ```java -Xmx240g -jar planetiler.jar --osm-path=us-260408.osm.pbf --output=data/us.mbtiles --download --force```
+3. Wait an hour and six minutes at least on even a BEAST of a workstation
 
 ## License
 
