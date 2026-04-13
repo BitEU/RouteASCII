@@ -146,43 +146,9 @@ static TileEntry *load_tile(int z, int x, int y)
     return te;
 }
 
-/* ---------------------------------------------------------------------------
- * Merge one tile's layers into the public cache->layers. We can't move
- * the features (the LRU still owns them), so we deep-copy them. This is
- * a few hundred malloc's per tile worst case — fast enough that we
- * redo it any time the visible set changes.
- * ---------------------------------------------------------------------*/
-
-static GeoRing ring_dup(const GeoRing *src)
-{
-    GeoRing dst = {0};
-    if (src->npoints <= 0 || !src->coords) return dst;
-    dst.coords = malloc((size_t)src->npoints * 2 * sizeof(float));
-    if (!dst.coords) return dst;
-    memcpy(dst.coords, src->coords, (size_t)src->npoints * 2 * sizeof(float));
-    dst.npoints = src->npoints;
-    return dst;
-}
-
-static void layer_append_copy(GeoLayer *dst, const GeoLayer *src)
-{
-    for (int i = 0; i < src->nfeatures; i++) {
-        const GeoFeature *sf = &src->features[i];
-        GeoFeature nf = *sf;
-        nf.rings = calloc((size_t)sf->nrings, sizeof(GeoRing));
-        if (!nf.rings) continue;
-        nf.nrings = 0;
-        for (int r = 0; r < sf->nrings; r++) {
-            nf.rings[nf.nrings] = ring_dup(&sf->rings[r]);
-            if (nf.rings[nf.nrings].coords) nf.nrings++;
-        }
-        if (nf.nrings > 0) {
-            geolayer_add(dst, nf);
-        } else {
-            free(nf.rings);
-        }
-    }
-}
+/* No more deep copy — the renderer iterates tile entries directly via
+ * osm_foreach_layer(). The active_tiles array in OsmCache holds pointers
+ * into the LRU, which owns the decoded features. */
 
 /* ---------------------------------------------------------------------------
  * Public API.
@@ -191,7 +157,6 @@ static void layer_append_copy(GeoLayer *dst, const GeoLayer *src)
 void osm_init(OsmCache *cache)
 {
     memset(cache, 0, sizeof(*cache));
-    for (int i = 0; i < OSM_LAYER_COUNT; i++) geolayer_init(&cache->layers[i]);
 
     if (g_mb) { mbtiles_close(g_mb); g_mb = NULL; }
     for (int i = 0; i < g_lru_n; i++) tile_entry_free_layers(&g_lru[i]);
@@ -219,7 +184,7 @@ void osm_init(OsmCache *cache)
 
 void osm_free(OsmCache *cache)
 {
-    for (int i = 0; i < OSM_LAYER_COUNT; i++) geolayer_free(&cache->layers[i]);
+    free(cache->active_tiles);
     memset(cache, 0, sizeof(*cache));
 
     for (int i = 0; i < g_lru_n; i++) tile_entry_free_layers(&g_lru[i]);
@@ -274,9 +239,10 @@ void osm_request_viewport(OsmCache *cache, MapView *mv)
 {
     if (!g_mb) return;                        /* file missing — nothing to do */
     if (mv->zoom < OSM_MIN_TILE_ZOOM) {
-        /* Too far out for detailed tiles. Clear any stale features. */
         if (g_vis_z != -1) {
-            for (int i = 0; i < OSM_LAYER_COUNT; i++) geolayer_free(&cache->layers[i]);
+            free(cache->active_tiles);
+            cache->active_tiles = NULL;
+            cache->active_count = 0;
             g_vis_z = -1;
         }
         return;
@@ -287,10 +253,6 @@ void osm_request_viewport(OsmCache *cache, MapView *mv)
     int x0, y0, x1, y1;
     viewport_tile_range(mv, tile_z, &x0, &y0, &x1, &y1);
 
-    /* Hard safety cap. With dynamic tile_z this should almost never
-     * trigger — a full-screen view at any single zoom level covers at
-     * most a few hundred tiles at that zoom. The cap is here as a
-     * last-resort guard against runaway memory. */
     int tiles_wide = x1 - x0 + 1;
     int tiles_tall = y1 - y0 + 1;
     long ntiles = (long)tiles_wide * (long)tiles_tall;
@@ -314,8 +276,11 @@ void osm_request_viewport(OsmCache *cache, MapView *mv)
     g_vis_x0 = x0; g_vis_x1 = x1;
     g_vis_y0 = y0; g_vis_y1 = y1;
 
-    /* Rebuild cache->layers from the visible tile set. */
-    for (int i = 0; i < OSM_LAYER_COUNT; i++) geolayer_free(&cache->layers[i]);
+    /* Build the active tile list — just pointers into the LRU, no copy. */
+    free(cache->active_tiles);
+    cache->active_tiles = malloc((size_t)ntiles * sizeof(TileEntry *));
+    cache->active_count = 0;
+    if (!cache->active_tiles) return;
 
     int loaded = 0, missed = 0;
     for (int y = y0; y <= y1; y++) {
@@ -323,9 +288,7 @@ void osm_request_viewport(OsmCache *cache, MapView *mv)
             TileEntry *te = load_tile(tile_z, x, y);
             if (!te) { missed++; continue; }
             loaded++;
-            for (int l = 0; l < OSM_LAYER_COUNT; l++) {
-                layer_append_copy(&cache->layers[l], &te->layers[l]);
-            }
+            cache->active_tiles[cache->active_count++] = te;
         }
     }
 
@@ -333,6 +296,16 @@ void osm_request_viewport(OsmCache *cache, MapView *mv)
              "OSM z%d: %d tiles (%ldx%ld) %s",
              tile_z, loaded, (long)tiles_wide, (long)tiles_tall,
              missed ? "(some missing)" : "");
+}
+
+void osm_foreach_layer(OsmCache *cache, OsmLayerId layer_id,
+                       OsmLayerCallback cb, void *ctx)
+{
+    for (int i = 0; i < cache->active_count; i++) {
+        TileEntry *te = cache->active_tiles[i];
+        if (te->layers[layer_id].nfeatures > 0)
+            cb(&te->layers[layer_id], ctx);
+    }
 }
 
 int osm_tick(OsmCache *cache) { (void)cache; return 0; }

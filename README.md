@@ -149,7 +149,7 @@ cmake --build build --config Release
 ## Convert *osm.pbf to usable data
 
 1. Download Windows tilemaker from https://github.com/systemed/tilemaker/releases
-2. Run ```java -Xmx128g -jar planetiler.jar --osm-path=us-260408.osm.pbf --output=data/us.mbtiles --download --force```
+2. Run ```java -Xmx240g -jar planetiler.jar --osm-path=us-260408.osm.pbf --output=data/us.mbtiles --download --force```
 
 ## License
 

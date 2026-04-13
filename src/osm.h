@@ -49,12 +49,22 @@ typedef enum {
     OSM_LAYER_COUNT
 } OsmLayerId;
 
+/* Forward-declare TileEntry so the header can expose a tile iterator.
+ * The struct definition lives in osm.c. */
+typedef struct TileEntry TileEntry;
+
 typedef struct {
     GeoLayer layers[OSM_LAYER_COUNT];
     int      tiles_pending;    /* legacy — always 0 now (sync loads) */
     int      last_error;
     char     status[128];
     int      mbtiles_ok;       /* 1 if the MBTiles file opened successfully */
+
+    /* Direct tile iteration — avoids deep-copying features from the
+     * LRU into cache->layers on every viewport change. Instead the
+     * renderer walks the active tile list. */
+    TileEntry **active_tiles;  /* array of pointers to LRU entries */
+    int         active_count;
 } OsmCache;
 
 /* Initialize the cache. Opens the MBTiles file at data/us.mbtiles. Safe to
@@ -69,6 +79,12 @@ void osm_free(OsmCache *cache);
  * Synchronous — just a few sqlite SELECTs + MVT decodes. Call once per
  * frame before rendering. */
 void osm_request_viewport(OsmCache *cache, MapView *mv);
+
+/* Iterate over the active tile set, calling render for each tile's layer.
+ * This avoids the expensive deep-copy into cache->layers entirely. */
+typedef void (*OsmLayerCallback)(const GeoLayer *layer, void *ctx);
+void osm_foreach_layer(OsmCache *cache, OsmLayerId layer_id,
+                       OsmLayerCallback cb, void *ctx);
 
 /* No-op retained for API compatibility with the old Overpass path. */
 int osm_tick(OsmCache *cache);

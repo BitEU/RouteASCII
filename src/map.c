@@ -11,6 +11,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -28,27 +34,70 @@ static int        g_dataset_initialized = 0;
 static OsmCache   g_osm;
 static int        g_osm_initialized = 0;
 
+/* Callback context for osm_foreach_layer → render_*_layer. */
+typedef struct {
+    WINDOW     *win;
+    MapView    *mv;
+    LayerStyle *style;
+} OsmRenderCtx;
+
+static void osm_cb_poly(const GeoLayer *l, void *ctx) {
+    OsmRenderCtx *c = ctx;
+    render_polygon_layer(c->win, c->mv, l, c->style);
+}
+static void osm_cb_line(const GeoLayer *l, void *ctx) {
+    OsmRenderCtx *c = ctx;
+    render_line_layer(c->win, c->mv, l, c->style);
+}
+static void osm_cb_place(const GeoLayer *l, void *ctx) {
+    OsmRenderCtx *c = ctx;
+    render_places_layer(c->win, c->mv, l);
+}
+
+/* Background loading state for LOD_10M.  0 = idle, 1 = loading, 2 = done */
+static volatile int g_10m_state = 0;
+
+#ifdef _WIN32
+static DWORD WINAPI bg_load_10m(LPVOID arg) {
+    (void)arg;
+    fprintf(stderr, "[geodata] background: loading 10m data...\n");
+    geodata_ensure_lod(&g_dataset, LOD_10M);
+    fprintf(stderr, "[geodata] background: 10m data ready\n");
+    g_10m_state = 2;
+    return 0;
+}
+#else
+static void *bg_load_10m(void *arg) {
+    (void)arg;
+    fprintf(stderr, "[geodata] background: loading 10m data...\n");
+    geodata_ensure_lod(&g_dataset, LOD_10M);
+    fprintf(stderr, "[geodata] background: 10m data ready\n");
+    g_10m_state = 2;
+    return NULL;
+}
+#endif
+
 static void ensure_dataset(MapView *mv)
 {
     if (!g_dataset_initialized) {
         geodata_init(&g_dataset);
         g_dataset_initialized = 1;
-        /* Only the tiny 110m set is loaded at startup so the first frame
-         * is instant. 50m (~10MB) is loaded lazily the first time the user
-         * zooms in past 4. */
         geodata_ensure_lod(&g_dataset, LOD_110M);
     }
-    /* Lazy upgrade to 50m when the user zooms in. Still synchronous — a
-     * one-time ~seconds pause the first time it's needed, not every frame. */
     if (mv->zoom >= 5 && !g_dataset.lod_loaded[LOD_50M]) {
         geodata_ensure_lod(&g_dataset, LOD_50M);
     }
-    /* LOD_10M is ~100MB and loads in ~10-20s the first time — one long
-     * pause, but without it zoom 8+ is basically empty (NE 50m has zero
-     * local road detail and coastlines are still very coarse). Worth the
-     * wait. Subsequent runs load from disk cache in ~1-2s. */
-    if (mv->zoom >= 8 && !g_dataset.lod_loaded[LOD_10M]) {
-        geodata_ensure_lod(&g_dataset, LOD_10M);
+    /* Kick off 10m load in a background thread so the UI stays responsive.
+     * The renderer uses 50m until 10m finishes loading. */
+    if (mv->zoom >= 8 && g_10m_state == 0) {
+        g_10m_state = 1;
+#ifdef _WIN32
+        CreateThread(NULL, 0, bg_load_10m, NULL, 0, NULL);
+#else
+        pthread_t t;
+        pthread_create(&t, NULL, bg_load_10m, NULL);
+        pthread_detach(t);
+#endif
     }
 }
 
@@ -132,32 +181,29 @@ void map_render(WINDOW *win, MapView *mv, RouteOverlay *overlay)
     /* --- 7b. OSM vector detail from local MBTiles ---
      * Starting at zoom 6 (where Natural Earth starts showing its age) we
      * overlay real OSM road networks, waterways, and waterbodies from a
-     * local us.mbtiles file generated offline by tilemaker. If the file
+     * local us.mbtiles file generated offline by planetiler. If the file
      * is missing the layers will be empty and we degrade gracefully. */
     if (mv->zoom >= 6) {
         if (!g_osm_initialized) { osm_init(&g_osm); g_osm_initialized = 1; }
         osm_request_viewport(&g_osm, mv);
 
-        /* Water polygons — render as fills so lakes/reservoirs punch
-         * through land. Note: rendered BEFORE strokes so route/roads
-         * sit on top. */
+        /* Water polygons */
         LayerStyle osm_water_fill = {
             .cp = CP_WATER, .attr = 0,
             .fill_ch = ' ', .stroke_ch = 0, .use_slope = 0
         };
-        render_polygon_layer(win, mv, &g_osm.layers[OSM_LAYER_WATER], &osm_water_fill);
+        OsmRenderCtx wctx = { win, mv, &osm_water_fill };
+        osm_foreach_layer(&g_osm, OSM_LAYER_WATER, osm_cb_poly, &wctx);
 
         /* Rivers / streams */
         LayerStyle osm_waterway = {
             .cp = CP_WATER, .attr = A_DIM,
             .fill_ch = 0,   .stroke_ch = '~', .use_slope = 0
         };
-        render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_WATERWAY], &osm_waterway);
+        OsmRenderCtx rwctx = { win, mv, &osm_waterway };
+        osm_foreach_layer(&g_osm, OSM_LAYER_WATERWAY, osm_cb_line, &rwctx);
 
-        /* ---- Per-zoom road class filter ----
-         * Restricting which classes render at low/mid zoom keeps the
-         * map readable. At zoom 6-8 we only want the interstates; by
-         * zoom 14 we want every residential street. */
+        /* Per-zoom road class filter */
         int show_motorway  = mv->zoom >= 6;
         int show_trunk     = mv->zoom >= 6;
         int show_primary   = mv->zoom >= 8;
@@ -167,7 +213,6 @@ void map_render(WINDOW *win, MapView *mv, RouteOverlay *overlay)
         int show_service   = mv->zoom >= 14;
         int show_path      = mv->zoom >= 15;
 
-        /* Styles: thicker/bolder glyphs for the more important classes. */
         LayerStyle st_motorway  = { .cp = CP_BORDER, .attr = A_BOLD,
                                     .fill_ch = 0, .stroke_ch = '=', .use_slope = 0 };
         LayerStyle st_trunk     = { .cp = CP_BORDER, .attr = A_BOLD,
@@ -186,14 +231,15 @@ void map_render(WINDOW *win, MapView *mv, RouteOverlay *overlay)
                                     .fill_ch = 0, .stroke_ch = ':', .use_slope = 0 };
 
         /* Draw order: least important first so majors sit on top. */
-        if (show_path)      render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_PATH], &st_path);
-        if (show_service)   render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_SERVICE], &st_service);
-        if (show_minor)     render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_MINOR], &st_minor);
-        if (show_tertiary)  render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_TERTIARY], &st_tertiary);
-        if (show_secondary) render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_SECONDARY], &st_secondary);
-        if (show_primary)   render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_PRIMARY], &st_primary);
-        if (show_trunk)     render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_TRUNK], &st_trunk);
-        if (show_motorway)  render_line_layer(win, mv, &g_osm.layers[OSM_LAYER_ROAD_MOTORWAY], &st_motorway);
+        OsmRenderCtx rctx = { win, mv, NULL };
+        if (show_path)      { rctx.style = &st_path;      osm_foreach_layer(&g_osm, OSM_LAYER_ROAD_PATH, osm_cb_line, &rctx); }
+        if (show_service)   { rctx.style = &st_service;    osm_foreach_layer(&g_osm, OSM_LAYER_ROAD_SERVICE, osm_cb_line, &rctx); }
+        if (show_minor)     { rctx.style = &st_minor;      osm_foreach_layer(&g_osm, OSM_LAYER_ROAD_MINOR, osm_cb_line, &rctx); }
+        if (show_tertiary)  { rctx.style = &st_tertiary;   osm_foreach_layer(&g_osm, OSM_LAYER_ROAD_TERTIARY, osm_cb_line, &rctx); }
+        if (show_secondary) { rctx.style = &st_secondary;  osm_foreach_layer(&g_osm, OSM_LAYER_ROAD_SECONDARY, osm_cb_line, &rctx); }
+        if (show_primary)   { rctx.style = &st_primary;    osm_foreach_layer(&g_osm, OSM_LAYER_ROAD_PRIMARY, osm_cb_line, &rctx); }
+        if (show_trunk)     { rctx.style = &st_trunk;      osm_foreach_layer(&g_osm, OSM_LAYER_ROAD_TRUNK, osm_cb_line, &rctx); }
+        if (show_motorway)  { rctx.style = &st_motorway;   osm_foreach_layer(&g_osm, OSM_LAYER_ROAD_MOTORWAY, osm_cb_line, &rctx); }
     }
 
     /* --- 9. OSRM route overlay (drawn into braille canvas too) --- */
@@ -224,7 +270,8 @@ void map_render(WINDOW *win, MapView *mv, RouteOverlay *overlay)
      * name) over Natural Earth's ~1000-city list. NE still wins below
      * that because OMT's place layer is sparse at low zoom levels. */
     if (mv->zoom >= 9 && g_osm_initialized && g_osm.mbtiles_ok) {
-        render_places_layer(win, mv, &g_osm.layers[OSM_LAYER_PLACE]);
+        OsmRenderCtx pctx = { win, mv, NULL };
+        osm_foreach_layer(&g_osm, OSM_LAYER_PLACE, osm_cb_place, &pctx);
     } else {
         render_places_layer(win, mv, &g_dataset.layers[lod][LAYER_POP_PLACES]);
     }
