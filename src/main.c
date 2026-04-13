@@ -83,11 +83,11 @@ int main(int argc, char *argv[])
 
         case KEY_UP:
         case 'k':
-            map_pan(&mv, 0, -1);
+            map_pan(&mv, 0, 1);
             break;
         case KEY_DOWN:
         case 'j':
-            map_pan(&mv, 0, 1);
+            map_pan(&mv, 0, -1);
             break;
         case KEY_LEFT:
         case 'h':
