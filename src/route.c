@@ -6,6 +6,61 @@
 #include <stdlib.h>
 #include <math.h>
 
+#define OSRM_DEFAULT_URL "http://127.0.0.1:5000"
+
+static const char *env_nonempty(const char *name)
+{
+    const char *v = getenv(name);
+    return (v && v[0]) ? v : NULL;
+}
+
+static long env_long_or_default(const char *name, long def,
+                                long min_value, long max_value)
+{
+    const char *v = getenv(name);
+    if (!v || !v[0]) return def;
+
+    char *end = NULL;
+    long parsed = strtol(v, &end, 10);
+    if (end == v || (end && *end != '\0')) return def;
+    if (parsed < min_value) return min_value;
+    if (parsed > max_value) return max_value;
+    return parsed;
+}
+
+static void trim_trailing_slashes(const char *src, char *dst, size_t dst_sz)
+{
+    if (!src || !dst || dst_sz == 0) return;
+    size_t n = strlen(src);
+    while (n > 0 && src[n - 1] == '/') n--;
+    if (n >= dst_sz) n = dst_sz - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+static int same_base_url(const char *a, const char *b)
+{
+    if (!a || !b) return 0;
+    char na[512], nb[512];
+    trim_trailing_slashes(a, na, sizeof(na));
+    trim_trailing_slashes(b, nb, sizeof(nb));
+    return strcmp(na, nb) == 0;
+}
+
+static void build_route_url(char *dst, size_t dst_sz, const char *base,
+                            double orig_lat, double orig_lon,
+                            double dest_lat, double dest_lon)
+{
+    char normalized_base[512];
+    trim_trailing_slashes(base, normalized_base, sizeof(normalized_base));
+    snprintf(dst, dst_sz,
+             "%s/route/v1/driving/"
+             "%.6f,%.6f;%.6f,%.6f"
+             "?overview=full&geometries=polyline&steps=true",
+             normalized_base,
+             orig_lon, orig_lat, dest_lon, dest_lat);
+}
+
 int route_decode_polyline(const char *encoded, RouteOverlay *overlay)
 {
     if (!encoded || !overlay) return -1;
@@ -52,26 +107,63 @@ RouteResult route_query(double orig_lat, double orig_lon,
     RouteResult rr;
     memset(&rr, 0, sizeof(rr));
 
+    const char *primary_base = env_nonempty("ROUTEASCII_OSRM_URL");
+    const char *fallback_base = env_nonempty("ROUTEASCII_OSRM_FALLBACK_URL");
+    if (!primary_base) primary_base = OSRM_DEFAULT_URL;
+
+    long primary_timeout_s = env_long_or_default("ROUTEASCII_OSRM_TIMEOUT_S", 25, 1, 600);
+    long primary_connect_timeout_s = env_long_or_default("ROUTEASCII_OSRM_CONNECT_TIMEOUT_S", 3, 1, 60);
+    long fallback_timeout_s = env_long_or_default("ROUTEASCII_OSRM_FALLBACK_TIMEOUT_S", 120, 1, 600);
+    long fallback_connect_timeout_s = env_long_or_default("ROUTEASCII_OSRM_FALLBACK_CONNECT_TIMEOUT_S", 10, 1, 60);
+
     char url[1024];
-    snprintf(url, sizeof(url),
-             "https://router.project-osrm.org/route/v1/driving/"
-             "%.6f,%.6f;%.6f,%.6f"
-             "?overview=full&geometries=polyline&steps=true",
-             orig_lon, orig_lat, dest_lon, dest_lat);
+    build_route_url(url, sizeof(url), primary_base,
+                    orig_lat, orig_lon, dest_lat, dest_lon);
 
     fprintf(stderr,
             "[route] OSRM request origin=(%.6f,%.6f) dest=(%.6f,%.6f)\n",
             orig_lat, orig_lon, dest_lat, dest_lon);
+    fprintf(stderr, "[route] endpoint: %s\n", primary_base);
     fprintf(stderr, "[route] URL: %s\n", url);
 
     HttpBuffer buf = {0};
-    if (http_get(url, &buf) != 0) {
-        const char *http_err = http_last_error();
-        snprintf(rr.error, sizeof(rr.error), "HTTP request failed%s%s",
-                 (http_err && http_err[0]) ? ": " : "",
-                 (http_err && http_err[0]) ? http_err : "");
-        fprintf(stderr, "[route] %s\n", rr.error);
-        return rr;
+    if (http_get_timeout(url, &buf, primary_timeout_s, primary_connect_timeout_s) != 0) {
+        const char *primary_err = http_last_error();
+        char primary_err_copy[256] = "unknown error";
+        if (primary_err && primary_err[0]) {
+            strncpy(primary_err_copy, primary_err, sizeof(primary_err_copy) - 1);
+            primary_err_copy[sizeof(primary_err_copy) - 1] = '\0';
+        }
+        fprintf(stderr, "[route] primary endpoint failed: %s\n", primary_err_copy);
+
+        if (fallback_base && fallback_base[0] && !same_base_url(primary_base, fallback_base)) {
+            fprintf(stderr, "[route] trying fallback endpoint: %s\n", fallback_base);
+            build_route_url(url, sizeof(url), fallback_base,
+                            orig_lat, orig_lon, dest_lat, dest_lon);
+            fprintf(stderr, "[route] fallback URL: %s\n", url);
+            if (http_get_timeout(url, &buf, fallback_timeout_s, fallback_connect_timeout_s) != 0) {
+                const char *fallback_err = http_last_error();
+                snprintf(rr.error, sizeof(rr.error),
+                         "OSRM failed (primary: %s, fallback: %s)",
+                         primary_err_copy,
+                         (fallback_err && fallback_err[0]) ? fallback_err : "unknown error");
+                fprintf(stderr, "[route] %s\n", rr.error);
+                return rr;
+            }
+            fprintf(stderr, "[route] fallback endpoint succeeded\n");
+        } else {
+            if (same_base_url(primary_base, OSRM_DEFAULT_URL)) {
+                snprintf(rr.error, sizeof(rr.error),
+                         "Local OSRM unavailable at %s (%s)",
+                         primary_base, primary_err_copy);
+            } else {
+                snprintf(rr.error, sizeof(rr.error),
+                         "OSRM request failed at %s (%s)",
+                         primary_base, primary_err_copy);
+            }
+            fprintf(stderr, "[route] %s\n", rr.error);
+            return rr;
+        }
     }
 
     fprintf(stderr, "[route] OSRM response size: %zu bytes\n", buf.size);

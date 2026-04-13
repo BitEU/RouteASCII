@@ -7,6 +7,8 @@
 
 #define INITIAL_BUF_SIZE 4096
 #define USER_AGENT       "RouteASCII/1.0 (TUI Map Viewer)"
+#define DEFAULT_TIMEOUT_S 15L
+#define DEFAULT_CONNECT_TIMEOUT_S 10L
 
 static CURL *g_curl = NULL;
 static char g_last_error[256] = "";
@@ -47,11 +49,12 @@ void http_init(void)
     if (g_curl) {
         curl_easy_setopt(g_curl, CURLOPT_USERAGENT, USER_AGENT);
         curl_easy_setopt(g_curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(g_curl, CURLOPT_TIMEOUT, 15L);
-        curl_easy_setopt(g_curl, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(g_curl, CURLOPT_TIMEOUT, DEFAULT_TIMEOUT_S);
+        curl_easy_setopt(g_curl, CURLOPT_CONNECTTIMEOUT, DEFAULT_CONNECT_TIMEOUT_S);
         curl_easy_setopt(g_curl, CURLOPT_WRITEFUNCTION, write_callback);
         g_last_error[0] = '\0';
-        fprintf(stderr, "[HTTP] initialized (timeout=15s connect=10s)\n");
+        fprintf(stderr, "[HTTP] initialized (timeout=%lds connect=%lds)\n",
+                DEFAULT_TIMEOUT_S, DEFAULT_CONNECT_TIMEOUT_S);
     } else {
         set_last_error("curl_easy_init failed");
         fprintf(stderr, "[HTTP] initialization failed: curl_easy_init returned NULL\n");
@@ -68,7 +71,8 @@ void http_cleanup(void)
     curl_global_cleanup();
 }
 
-static int do_get(const char *url, HttpBuffer *buf)
+static int do_get(const char *url, HttpBuffer *buf,
+                  long timeout_s, long connect_timeout_s)
 {
     if (!g_curl || !url || !buf) {
         set_last_error("HTTP subsystem not initialized");
@@ -81,10 +85,16 @@ static int do_get(const char *url, HttpBuffer *buf)
     buf->size = 0;
     buf->capacity = 0;
 
+        if (timeout_s <= 0) timeout_s = DEFAULT_TIMEOUT_S;
+        if (connect_timeout_s <= 0) connect_timeout_s = DEFAULT_CONNECT_TIMEOUT_S;
+
     curl_easy_setopt(g_curl, CURLOPT_URL, url);
     curl_easy_setopt(g_curl, CURLOPT_WRITEDATA, buf);
+        curl_easy_setopt(g_curl, CURLOPT_TIMEOUT, timeout_s);
+        curl_easy_setopt(g_curl, CURLOPT_CONNECTTIMEOUT, connect_timeout_s);
 
-    fprintf(stderr, "[HTTP] GET %s\n", url);
+        fprintf(stderr, "[HTTP] GET %s (timeout=%lds connect=%lds)\n",
+            url, timeout_s, connect_timeout_s);
 
     CURLcode res = curl_easy_perform(g_curl);
     double total_s = 0.0;
@@ -131,12 +141,18 @@ static int do_get(const char *url, HttpBuffer *buf)
 
 int http_get(const char *url, HttpBuffer *buf)
 {
-    return do_get(url, buf);
+    return do_get(url, buf, DEFAULT_TIMEOUT_S, DEFAULT_CONNECT_TIMEOUT_S);
+}
+
+int http_get_timeout(const char *url, HttpBuffer *buf,
+                     long timeout_s, long connect_timeout_s)
+{
+    return do_get(url, buf, timeout_s, connect_timeout_s);
 }
 
 int http_get_binary(const char *url, HttpBuffer *buf)
 {
-    return do_get(url, buf);
+    return do_get(url, buf, DEFAULT_TIMEOUT_S, DEFAULT_CONNECT_TIMEOUT_S);
 }
 
 void http_buffer_free(HttpBuffer *buf)

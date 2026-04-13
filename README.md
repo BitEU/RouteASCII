@@ -16,7 +16,7 @@ ASCII art with Web-Mercator projection, and overlays OSRM-computed driving route
   disk
 - **Pan & Zoom** — Arrow keys to pan, +/- to zoom (levels 2–16)
 - **Geocoding** — Type place names to jump to locations (via Nominatim)
-- **Route Plotting** — Enter origin & destination for A→B driving routes (via OSRM)
+- **Route Plotting** — Enter origin & destination for A→B driving routes (OSRM, local-first)
 - **Turn-by-Turn Directions** — Sidebar with maneuver list, distance & duration
 - **Route Overlay** — Route polyline drawn on the ASCII map with highlighted waypoints
 
@@ -131,6 +131,48 @@ vcpkg install
 $vcpkgRoot = Split-Path (Get-Command vcpkg).Source -Parent
 cmake -B build -DCMAKE_TOOLCHAIN_FILE="$vcpkgRoot\scripts\buildsystems\vcpkg.cmake"
 cmake --build build --config Release
+.\build\Release\routeascii.exe
+```
+
+## Local OSRM (recommended)
+
+RouteASCII now defaults to querying OSRM at `http://127.0.0.1:5000`.
+Use the helper script below to preprocess data and run `osrm-routed` in Docker.
+
+### Quick start on Windows
+
+```powershell
+.\scripts\osrm-local.ps1 -Action all -PbfPath .\us-260408.osm.pbf
+
+# Then run the app
+.\build\Release\routeascii.exe
+```
+
+### Script actions
+
+```powershell
+.\scripts\osrm-local.ps1 -Action prep   # preprocess only
+.\scripts\osrm-local.ps1 -Action start  # preprocess if needed + run container
+.\scripts\osrm-local.ps1 -Action status # show container status
+.\scripts\osrm-local.ps1 -Action monitor # live CPU/log/file progress view
+.\scripts\osrm-local.ps1 -Action stop   # stop/remove container
+```
+
+### OSRM endpoint configuration
+
+Route query behavior can be controlled with environment variables:
+
+- `ROUTEASCII_OSRM_URL` (default: `http://127.0.0.1:5000`)
+- `ROUTEASCII_OSRM_TIMEOUT_S` (default: `25`)
+- `ROUTEASCII_OSRM_CONNECT_TIMEOUT_S` (default: `3`)
+- `ROUTEASCII_OSRM_FALLBACK_URL` (unset by default)
+- `ROUTEASCII_OSRM_FALLBACK_TIMEOUT_S` (default: `120`)
+- `ROUTEASCII_OSRM_FALLBACK_CONNECT_TIMEOUT_S` (default: `10`)
+
+Example with public fallback:
+
+```powershell
+$env:ROUTEASCII_OSRM_FALLBACK_URL = "https://router.project-osrm.org"
 .\build\Release\routeascii.exe
 ```
 

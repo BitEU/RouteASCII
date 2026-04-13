@@ -20,6 +20,11 @@ void http_cleanup(void);
    Caller must call http_buffer_free() on buf after use. */
 int http_get(const char *url, HttpBuffer *buf);
 
+/* Perform a GET request with explicit timeout settings (seconds).
+    timeout_s <= 0 means use library defaults. connect_timeout_s <= 0 means use defaults. */
+int http_get_timeout(const char *url, HttpBuffer *buf,
+                            long timeout_s, long connect_timeout_s);
+
 /* Download binary data (e.g., PNG tiles). Returns 0 on success. */
 int http_get_binary(const char *url, HttpBuffer *buf);
 
