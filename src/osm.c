@@ -229,9 +229,9 @@ void osm_free(OsmCache *cache)
     if (g_mb) { mbtiles_close(g_mb); g_mb = NULL; }
 }
 
-/* Convert viewport to z=14 tile range. We use geo.c's slippy-tile math
- * directly — the map projection already matches. */
-static void viewport_tile_range(MapView *mv,
+/* Convert viewport to tile range at the given tile zoom. We use geo.c's
+ * slippy-tile math directly — the map projection already matches. */
+static void viewport_tile_range(MapView *mv, int tile_z,
                                 int *x0, int *y0, int *x1, int *y1)
 {
     double lat_tl, lon_tl, lat_br, lon_br;
@@ -245,13 +245,29 @@ static void viewport_tile_range(MapView *mv,
     if (lat_br < -85.0) lat_br = -85.0;
 
     int ax, ay, bx, by;
-    geo_latlon_to_tile(lat_tl, lon_tl, OSM_TILE_Z, &ax, &ay);
-    geo_latlon_to_tile(lat_br, lon_br, OSM_TILE_Z, &bx, &by);
+    geo_latlon_to_tile(lat_tl, lon_tl, tile_z, &ax, &ay);
+    geo_latlon_to_tile(lat_br, lon_br, tile_z, &bx, &by);
 
     *x0 = ax < bx ? ax : bx;
     *x1 = ax > bx ? ax : bx;
     *y0 = ay < by ? ay : by;
     *y1 = ay > by ? ay : by;
+}
+
+/* Pick the tile zoom we should pull from the mbtiles for a given map
+ * zoom. Rule: match the map zoom, clamped to what the mbtiles actually
+ * contains. This keeps the on-screen feature density roughly constant:
+ * at map zoom 9 we pull z=9 tiles (each covering the same slippy-tile
+ * area the viewport shows), and at map zoom 14+ we max out at z=14
+ * since that's our basezoom. */
+static int pick_tile_zoom(const MapView *mv)
+{
+    int z = mv->zoom;
+    int zmin = mbtiles_minzoom(g_mb);
+    int zmax = mbtiles_maxzoom(g_mb);
+    if (z < zmin) z = zmin;
+    if (z > zmax) z = zmax;
+    return z;
 }
 
 void osm_request_viewport(OsmCache *cache, MapView *mv)
@@ -266,20 +282,21 @@ void osm_request_viewport(OsmCache *cache, MapView *mv)
         return;
     }
 
-    int x0, y0, x1, y1;
-    viewport_tile_range(mv, &x0, &y0, &x1, &y1);
+    int tile_z = pick_tile_zoom(mv);
 
-    /* Hard safety cap. At zoom 6 a world-scale view could in principle
-     * cover thousands of z=14 tiles — refuse to try. This is the same
-     * tile-count guard we used to have for Overpass, but a much higher
-     * ceiling since local reads are cheap. */
+    int x0, y0, x1, y1;
+    viewport_tile_range(mv, tile_z, &x0, &y0, &x1, &y1);
+
+    /* Hard safety cap. With dynamic tile_z this should almost never
+     * trigger — a full-screen view at any single zoom level covers at
+     * most a few hundred tiles at that zoom. The cap is here as a
+     * last-resort guard against runaway memory. */
     int tiles_wide = x1 - x0 + 1;
     int tiles_tall = y1 - y0 + 1;
     long ntiles = (long)tiles_wide * (long)tiles_tall;
     if (ntiles > 2048) {
-        /* Shrink around the center to at most ~2048 tiles. */
         int cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
-        int half = 22;                        /* ~44x44 = 1936 tiles */
+        int half = 22;
         x0 = cx - half; x1 = cx + half;
         y0 = cy - half; y1 = cy + half;
         tiles_wide = x1 - x0 + 1;
@@ -288,12 +305,12 @@ void osm_request_viewport(OsmCache *cache, MapView *mv)
     }
 
     /* Skip rebuild if the visible set hasn't changed. */
-    if (g_vis_z == OSM_TILE_Z &&
+    if (g_vis_z == tile_z &&
         g_vis_x0 == x0 && g_vis_x1 == x1 &&
         g_vis_y0 == y0 && g_vis_y1 == y1) {
         return;
     }
-    g_vis_z  = OSM_TILE_Z;
+    g_vis_z  = tile_z;
     g_vis_x0 = x0; g_vis_x1 = x1;
     g_vis_y0 = y0; g_vis_y1 = y1;
 
@@ -303,7 +320,7 @@ void osm_request_viewport(OsmCache *cache, MapView *mv)
     int loaded = 0, missed = 0;
     for (int y = y0; y <= y1; y++) {
         for (int x = x0; x <= x1; x++) {
-            TileEntry *te = load_tile(OSM_TILE_Z, x, y);
+            TileEntry *te = load_tile(tile_z, x, y);
             if (!te) { missed++; continue; }
             loaded++;
             for (int l = 0; l < OSM_LAYER_COUNT; l++) {
@@ -313,8 +330,8 @@ void osm_request_viewport(OsmCache *cache, MapView *mv)
     }
 
     snprintf(cache->status, sizeof(cache->status),
-             "OSM: %d tiles (%ldx%ld) %s",
-             loaded, (long)tiles_wide, (long)tiles_tall,
+             "OSM z%d: %d tiles (%ldx%ld) %s",
+             tile_z, loaded, (long)tiles_wide, (long)tiles_tall,
              missed ? "(some missing)" : "");
 }
 

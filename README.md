@@ -19,7 +19,6 @@ ASCII art with Web-Mercator projection, and overlays OSRM-computed driving route
 - **Route Plotting** — Enter origin & destination for A→B driving routes (via OSRM)
 - **Turn-by-Turn Directions** — Sidebar with maneuver list, distance & duration
 - **Route Overlay** — Route polyline drawn on the ASCII map with highlighted waypoints
-- **Cross-platform** — Targets Windows (PDCurses) and Linux/macOS (ncurses)
 
 ## Architecture
 
@@ -135,12 +134,6 @@ cmake --build build --config Release
 .\build\Release\routeascii.exe
 ```
 
-### Windows (MinGW)
-```cmd
-make -f Makefile.win
-routeascii.exe
-```
-
 ## Controls
 
 | Key          | Action                          |
@@ -153,14 +146,10 @@ routeascii.exe
 | c            | Clear route                     |
 | q / Esc      | Quit                            |
 
-## API Usage (no keys required)
+## Convert *osm.pbf to usable data
 
-- **Map tiles**: OpenStreetMap raster tiles (respected usage policy)
-- **Routing**: OSRM demo server (`router.project-osrm.org`)
-- **Geocoding**: Nominatim (`nominatim.openstreetmap.org`)
-
-> Note: The OSRM demo server is for light use. For heavy usage,
-> self-host OSRM or use a commercial provider.
+1. Download Windows tilemaker from https://github.com/systemed/tilemaker/releases
+2. Run ```java -Xmx128g -jar planetiler.jar --osm-path=us-260408.osm.pbf --output=data/us.mbtiles --download --force```
 
 ## License
 

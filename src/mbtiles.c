@@ -121,14 +121,16 @@ int mbtiles_get_tile(Mbtiles *m, int z, int x, int y,
     if (out_size) *out_size = 0;
     if (!m || !m->get_stmt) return -1;
 
-    /* XYZ -> TMS Y flip. At zoom z, world height is (1 << z). */
-    int tms_y = ((1 << z) - 1) - y;
+    /* Planetiler writes XYZ-convention tile_row values, so no Y-flip
+     * is needed. Traditional TMS-convention mbtiles (e.g. from
+     * tilemaker) would need: tms_y = ((1 << z) - 1) - y; but our
+     * tiles come from planetiler which stores Y directly. */
 
     sqlite3_reset(m->get_stmt);
     sqlite3_clear_bindings(m->get_stmt);
     sqlite3_bind_int(m->get_stmt, 1, z);
     sqlite3_bind_int(m->get_stmt, 2, x);
-    sqlite3_bind_int(m->get_stmt, 3, tms_y);
+    sqlite3_bind_int(m->get_stmt, 3, y);
 
     int rc = sqlite3_step(m->get_stmt);
     if (rc != SQLITE_ROW) return -1;
