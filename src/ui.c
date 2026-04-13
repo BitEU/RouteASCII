@@ -11,6 +11,9 @@ void ui_init(UIState *ui)
     /* Enable the user's locale so ncursesw / PDCurses can render UTF-8
      * braille glyphs used by the subpixel canvas. No-op if already set. */
     setlocale(LC_ALL, "");
+    /* Force dot decimal formatting for URL numeric params regardless of OS locale. */
+    setlocale(LC_NUMERIC, "C");
+    fprintf(stderr, "[ui] locale initialized (LC_NUMERIC=C)\n");
 
     initscr();
     cbreak();
@@ -50,6 +53,8 @@ void ui_init(UIState *ui)
     ui->map_win = newwin(map_h, map_w, 0, 0);
     ui->status_win = newwin(2, ui->term_w, map_h, 0);
     ui->sidebar_win = NULL;
+    fprintf(stderr, "[ui] windows created map=%dx%d status=2x%d\n",
+            map_w, map_h, ui->term_w);
 }
 
 void ui_cleanup(UIState *ui)
@@ -86,6 +91,10 @@ void ui_resize(UIState *ui)
     } else {
         ui->sidebar_win = NULL;
     }
+
+    fprintf(stderr, "[ui] resize -> term=%dx%d map=%dx%d sidebar=%s\n",
+            ui->term_w, ui->term_h, map_w, map_h,
+            ui->sidebar_visible ? "on" : "off");
 }
 
 void ui_draw_status(UIState *ui, MapView *mv, const char *message)
@@ -262,4 +271,6 @@ void ui_toggle_sidebar(UIState *ui)
     ui->sidebar_visible = !ui->sidebar_visible;
     ui->sidebar_scroll = 0;
     ui_resize(ui);
+    fprintf(stderr, "[ui] sidebar toggled -> %s\n",
+            ui->sidebar_visible ? "visible" : "hidden");
 }

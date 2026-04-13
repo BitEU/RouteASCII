@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <ctype.h>
 
 #define _MAP_NEEDS_CURSES
 #include "http.h"
@@ -20,6 +21,66 @@ static void handle_winch(int sig)
 }
 #endif
 
+static int parse_latlon_input(const char *text, double *lat, double *lon)
+{
+    if (!text || !lat || !lon) return 0;
+
+    const char *p = text;
+    while (isspace((unsigned char)*p)) p++;
+    if (!*p) return 0;
+
+    char *end = NULL;
+    double a = strtod(p, &end);
+    if (end == p) return 0;
+    p = end;
+
+    while (isspace((unsigned char)*p)) p++;
+    if (*p == ',' || *p == ';') p++;
+    while (isspace((unsigned char)*p)) p++;
+
+    double b = strtod(p, &end);
+    if (end == p) return 0;
+    p = end;
+
+    while (isspace((unsigned char)*p)) p++;
+    if (*p != '\0') return 0;
+
+    if (a < -90.0 || a > 90.0 || b < -180.0 || b > 180.0) return 0;
+
+    *lat = a;
+    *lon = b;
+    return 1;
+}
+
+static GeoResult resolve_location_input(const char *input, const char *label)
+{
+    GeoResult gr = {0};
+    double lat = 0.0, lon = 0.0;
+
+    if (parse_latlon_input(input, &lat, &lon)) {
+        gr.valid = 1;
+        gr.lat = lat;
+        gr.lon = lon;
+        snprintf(gr.display_name, sizeof(gr.display_name),
+                 "%.6f, %.6f", lat, lon);
+        fprintf(stderr, "[geo] %s parsed as coordinates: %.6f, %.6f\n",
+                label ? label : "location", lat, lon);
+        return gr;
+    }
+
+    fprintf(stderr, "[geo] %s geocoding query: \"%s\"\n",
+            label ? label : "location", input ? input : "");
+    gr = geo_search(input);
+    if (gr.valid) {
+        fprintf(stderr, "[geo] %s resolved to %.6f, %.6f (%s)\n",
+                label ? label : "location", gr.lat, gr.lon, gr.display_name);
+    } else {
+        fprintf(stderr, "[geo] %s geocoding failed for \"%s\"\n",
+                label ? label : "location", input ? input : "");
+    }
+    return gr;
+}
+
 int main(int argc, char *argv[])
 {
     (void)argc;
@@ -32,17 +93,24 @@ int main(int argc, char *argv[])
     FILE *logf = freopen("console.log", "w", stderr);
     if (logf) setvbuf(logf, NULL, _IONBF, 0);
 
+        fprintf(stderr, "[app] starting RouteASCII\n");
+
     /* Initialize subsystems */
     http_init();
+        fprintf(stderr, "[app] HTTP subsystem initialized\n");
 
     UIState ui;
     ui_init(&ui);
+        fprintf(stderr, "[app] UI initialized (%dx%d)\n", ui.term_w, ui.term_h);
 
     MapView mv;
     map_init(&mv);
+        fprintf(stderr, "[app] map initialized at lat=%.4f lon=%.4f zoom=%d\n",
+            mv.center_lat, mv.center_lon, mv.zoom);
 
     RouteOverlay overlay;
     route_overlay_init(&overlay);
+        fprintf(stderr, "[app] route overlay initialized\n");
 
     RouteResult route_result;
     memset(&route_result, 0, sizeof(route_result));
@@ -118,14 +186,17 @@ int main(int argc, char *argv[])
                 ui_draw_status(&ui, &mv, status_msg);
                 doupdate();
 
-                GeoResult gr = geo_search(query);
+                GeoResult gr = resolve_location_input(query, "goto");
                 if (gr.valid) {
                     map_center_on(&mv, gr.lat, gr.lon);
                     snprintf(status_msg, sizeof(status_msg),
                              "Found: %.60s", gr.display_name);
+                    fprintf(stderr, "[app] goto success -> center %.6f, %.6f\n",
+                            gr.lat, gr.lon);
                 } else {
                     snprintf(status_msg, sizeof(status_msg),
                              "Not found: %s", query);
+                    fprintf(stderr, "[app] goto failed for \"%s\"\n", query);
                 }
             }
             break;
@@ -146,24 +217,30 @@ int main(int argc, char *argv[])
             snprintf(status_msg, sizeof(status_msg), "Calculating route...");
             ui_draw_status(&ui, &mv, status_msg);
             doupdate();
+            fprintf(stderr, "[app] route requested: origin=\"%s\" destination=\"%s\"\n",
+                    orig_str, dest_str);
 
             /* Geocode origin */
-            GeoResult orig_geo = geo_search(orig_str);
+            GeoResult orig_geo = resolve_location_input(orig_str, "origin");
             if (!orig_geo.valid) {
                 snprintf(status_msg, sizeof(status_msg),
                          "Could not find origin: %s", orig_str);
+                fprintf(stderr, "[app] route aborted: origin lookup failed\n");
                 break;
             }
 
             /* Geocode destination */
-            GeoResult dest_geo = geo_search(dest_str);
+            GeoResult dest_geo = resolve_location_input(dest_str, "destination");
             if (!dest_geo.valid) {
                 snprintf(status_msg, sizeof(status_msg),
                          "Could not find destination: %s", dest_str);
+                fprintf(stderr, "[app] route aborted: destination lookup failed\n");
                 break;
             }
 
             /* Query OSRM */
+            fprintf(stderr, "[app] querying route %.6f,%.6f -> %.6f,%.6f\n",
+                    orig_geo.lat, orig_geo.lon, dest_geo.lat, dest_geo.lon);
             route_result = route_query(orig_geo.lat, orig_geo.lon,
                                        dest_geo.lat, dest_geo.lon,
                                        &overlay);
@@ -196,6 +273,8 @@ int main(int argc, char *argv[])
                 snprintf(status_msg, sizeof(status_msg),
                          "Route: %s, %s (%d steps). Press [d] for directions.",
                          dist_buf, dur_buf, route_result.step_count);
+                fprintf(stderr, "[app] route success: %s, %s, %d steps\n",
+                        dist_buf, dur_buf, route_result.step_count);
 
                 /* Auto-show sidebar */
                 if (!ui.sidebar_visible) {
@@ -204,6 +283,7 @@ int main(int argc, char *argv[])
             } else {
                 snprintf(status_msg, sizeof(status_msg),
                          "Route error: %s", route_result.error);
+                fprintf(stderr, "[app] route error: %s\n", route_result.error);
             }
             break;
         }
@@ -218,6 +298,7 @@ int main(int argc, char *argv[])
             route_overlay_clear(&overlay);
             memset(&route_result, 0, sizeof(route_result));
             snprintf(status_msg, sizeof(status_msg), "Route cleared.");
+            fprintf(stderr, "[app] route cleared by user\n");
             if (ui.sidebar_visible) ui_toggle_sidebar(&ui);
             break;
 
@@ -264,6 +345,7 @@ int main(int argc, char *argv[])
     map_shutdown();
     ui_cleanup(&ui);
     http_cleanup();
+    fprintf(stderr, "[app] shutdown complete\n");
 
     return 0;
 }

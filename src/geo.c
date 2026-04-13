@@ -43,12 +43,24 @@ GeoResult geo_search(const char *query)
              "https://nominatim.openstreetmap.org/search?q=%s&format=json&limit=1",
              encoded);
 
+    fprintf(stderr, "[geo] nominatim search URL: %s\n", url);
+
     HttpBuffer buf = {0};
-    if (http_get(url, &buf) != 0) return result;
+    if (http_get(url, &buf) != 0) {
+        const char *http_err = http_last_error();
+        fprintf(stderr, "[geo] nominatim search failed: %s\n",
+                (http_err && http_err[0]) ? http_err : "unknown HTTP error");
+        return result;
+    }
+
+    fprintf(stderr, "[geo] nominatim search response: %zu bytes\n", buf.size);
 
     cJSON *root = cJSON_Parse(buf.data);
     http_buffer_free(&buf);
-    if (!root) return result;
+    if (!root) {
+        fprintf(stderr, "[geo] nominatim search JSON parse failed\n");
+        return result;
+    }
 
     if (cJSON_IsArray(root) && cJSON_GetArraySize(root) > 0) {
         cJSON *item = cJSON_GetArrayItem(root, 0);
@@ -64,7 +76,13 @@ GeoResult geo_search(const char *query)
                         sizeof(result.display_name) - 1);
             }
             result.valid = 1;
+            fprintf(stderr, "[geo] nominatim search hit: %.6f, %.6f (%s)\n",
+                    result.lat, result.lon, result.display_name);
         }
+    }
+
+    if (!result.valid) {
+        fprintf(stderr, "[geo] nominatim search returned no results\n");
     }
 
     cJSON_Delete(root);
@@ -80,12 +98,24 @@ GeoResult geo_reverse(double lat, double lon)
              "https://nominatim.openstreetmap.org/reverse?lat=%.6f&lon=%.6f&format=json",
              lat, lon);
 
+    fprintf(stderr, "[geo] nominatim reverse URL: %s\n", url);
+
     HttpBuffer buf = {0};
-    if (http_get(url, &buf) != 0) return result;
+    if (http_get(url, &buf) != 0) {
+        const char *http_err = http_last_error();
+        fprintf(stderr, "[geo] nominatim reverse failed: %s\n",
+                (http_err && http_err[0]) ? http_err : "unknown HTTP error");
+        return result;
+    }
+
+    fprintf(stderr, "[geo] nominatim reverse response: %zu bytes\n", buf.size);
 
     cJSON *root = cJSON_Parse(buf.data);
     http_buffer_free(&buf);
-    if (!root) return result;
+    if (!root) {
+        fprintf(stderr, "[geo] nominatim reverse JSON parse failed\n");
+        return result;
+    }
 
     cJSON *name_j = cJSON_GetObjectItem(root, "display_name");
     if (name_j && cJSON_GetStringValue(name_j)) {
@@ -94,6 +124,11 @@ GeoResult geo_reverse(double lat, double lon)
         strncpy(result.display_name, cJSON_GetStringValue(name_j),
                 sizeof(result.display_name) - 1);
         result.valid = 1;
+        fprintf(stderr, "[geo] nominatim reverse hit: %s\n", result.display_name);
+    }
+
+    if (!result.valid) {
+        fprintf(stderr, "[geo] nominatim reverse returned no display_name\n");
     }
 
     cJSON_Delete(root);

@@ -26,4 +26,7 @@ int http_get_binary(const char *url, HttpBuffer *buf);
 /* Free an HttpBuffer's contents */
 void http_buffer_free(HttpBuffer *buf);
 
+/* Human-readable description of the last HTTP error, or empty string. */
+const char *http_last_error(void);
+
 #endif /* HTTP_H */

@@ -59,25 +59,42 @@ RouteResult route_query(double orig_lat, double orig_lon,
              "?overview=full&geometries=polyline&steps=true",
              orig_lon, orig_lat, dest_lon, dest_lat);
 
+    fprintf(stderr,
+            "[route] OSRM request origin=(%.6f,%.6f) dest=(%.6f,%.6f)\n",
+            orig_lat, orig_lon, dest_lat, dest_lon);
+    fprintf(stderr, "[route] URL: %s\n", url);
+
     HttpBuffer buf = {0};
     if (http_get(url, &buf) != 0) {
-        snprintf(rr.error, sizeof(rr.error), "HTTP request failed");
+        const char *http_err = http_last_error();
+        snprintf(rr.error, sizeof(rr.error), "HTTP request failed%s%s",
+                 (http_err && http_err[0]) ? ": " : "",
+                 (http_err && http_err[0]) ? http_err : "");
+        fprintf(stderr, "[route] %s\n", rr.error);
         return rr;
     }
 
-    cJSON *root = cJSON_Parse(buf.data);
-    http_buffer_free(&buf);
+    fprintf(stderr, "[route] OSRM response size: %zu bytes\n", buf.size);
 
+    cJSON *root = cJSON_Parse(buf.data);
     if (!root) {
+        fprintf(stderr, "[route] JSON parse failed. body preview: %.120s\n",
+                buf.data ? buf.data : "");
+        http_buffer_free(&buf);
         snprintf(rr.error, sizeof(rr.error), "JSON parse failed");
         return rr;
     }
+    http_buffer_free(&buf);
 
     cJSON *code = cJSON_GetObjectItem(root, "code");
-    if (!code || strcmp(cJSON_GetStringValue(code), "Ok") != 0) {
+    const char *code_s = (code && cJSON_IsString(code)) ? cJSON_GetStringValue(code) : NULL;
+    if (!code_s || strcmp(code_s, "Ok") != 0) {
         cJSON *msg = cJSON_GetObjectItem(root, "message");
+        const char *msg_s = (msg && cJSON_IsString(msg)) ? cJSON_GetStringValue(msg) : "unknown";
         snprintf(rr.error, sizeof(rr.error), "OSRM error: %s",
-                 msg ? cJSON_GetStringValue(msg) : "unknown");
+                 msg_s ? msg_s : "unknown");
+        fprintf(stderr, "[route] OSRM returned code=%s message=%s\n",
+                code_s ? code_s : "(missing)", msg_s ? msg_s : "unknown");
         cJSON_Delete(root);
         return rr;
     }
@@ -85,6 +102,7 @@ RouteResult route_query(double orig_lat, double orig_lon,
     cJSON *routes = cJSON_GetObjectItem(root, "routes");
     if (!cJSON_IsArray(routes) || cJSON_GetArraySize(routes) == 0) {
         snprintf(rr.error, sizeof(rr.error), "No routes found");
+        fprintf(stderr, "[route] OSRM returned no routes\n");
         cJSON_Delete(root);
         return rr;
     }
@@ -96,17 +114,22 @@ RouteResult route_query(double orig_lat, double orig_lon,
     cJSON *dur_j  = cJSON_GetObjectItem(route, "duration");
     rr.total_distance_m = dist_j ? cJSON_GetNumberValue(dist_j) : 0;
     rr.total_duration_s = dur_j  ? cJSON_GetNumberValue(dur_j)  : 0;
+    fprintf(stderr, "[route] summary: distance=%.1fm duration=%.1fs\n",
+            rr.total_distance_m, rr.total_duration_s);
 
     /* Decode geometry */
     cJSON *geom = cJSON_GetObjectItem(route, "geometry");
     if (geom && cJSON_IsString(geom)) {
         route_overlay_clear(overlay);
-        route_decode_polyline(cJSON_GetStringValue(geom), overlay);
+        int decoded = route_decode_polyline(cJSON_GetStringValue(geom), overlay);
         overlay->orig_lat = orig_lat;
         overlay->orig_lon = orig_lon;
         overlay->dest_lat = dest_lat;
         overlay->dest_lon = dest_lon;
         overlay->has_route = 1;
+        fprintf(stderr, "[route] decoded %d polyline points\n", decoded);
+    } else {
+        fprintf(stderr, "[route] warning: route geometry missing or not a string\n");
     }
 
     /* Parse steps for turn-by-turn directions */
@@ -160,9 +183,11 @@ RouteResult route_query(double orig_lat, double orig_lon,
             }
         }
         rr.step_count = step_idx;
+        fprintf(stderr, "[route] parsed %d turn steps\n", rr.step_count);
     }
 
     rr.valid = 1;
+    fprintf(stderr, "[route] route query complete\n");
     cJSON_Delete(root);
     return rr;
 }
