@@ -5,6 +5,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
+#include <ctype.h>
+#include <errno.h>
 
 #define OSRM_DEFAULT_URL "http://127.0.0.1:5000"
 
@@ -59,6 +62,36 @@ static void build_route_url(char *dst, size_t dst_sz, const char *base,
              "?overview=full&geometries=polyline&steps=true",
              normalized_base,
              orig_lon, orig_lat, dest_lon, dest_lat);
+}
+
+static void sanitize_filename_component(const char *src, char *dst, size_t dst_sz)
+{
+    if (!dst || dst_sz == 0) return;
+
+    size_t j = 0;
+    int last_was_sep = 0;
+
+    if (!src) src = "";
+
+    for (size_t i = 0; src[i] != '\0' && j < dst_sz - 1; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (isalnum(c)) {
+            dst[j++] = (char)tolower(c);
+            last_was_sep = 0;
+        } else if (j > 0 && !last_was_sep) {
+            dst[j++] = '_';
+            last_was_sep = 1;
+        }
+    }
+
+    while (j > 0 && dst[j - 1] == '_') j--;
+
+    if (j == 0) {
+        strncpy(dst, "unknown", dst_sz - 1);
+        dst[dst_sz - 1] = '\0';
+    } else {
+        dst[j] = '\0';
+    }
 }
 
 int route_decode_polyline(const char *encoded, RouteOverlay *overlay)
@@ -308,4 +341,108 @@ void route_format_distance(double meters, char *buf, size_t buf_sz, int use_mile
         else
             snprintf(buf, buf_sz, "%.1f km", meters / 1000.0);
     }
+}
+
+int route_export_directions(const RouteResult *rr,
+                            const char *origin_label,
+                            const char *destination_label,
+                            char *out_path, size_t out_path_sz,
+                            char *err, size_t err_sz)
+{
+    if (out_path && out_path_sz > 0) out_path[0] = '\0';
+    if (err && err_sz > 0) err[0] = '\0';
+
+    if (!rr || !rr->valid || rr->step_count <= 0) {
+        if (err && err_sz > 0) {
+            snprintf(err, err_sz, "No valid route loaded");
+        }
+        return -1;
+    }
+
+    time_t now = time(NULL);
+    if (now == (time_t)-1) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "Could not read system time");
+        return -1;
+    }
+
+    struct tm utc_tm;
+#ifdef _WIN32
+    if (gmtime_s(&utc_tm, &now) != 0) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "Could not convert system time");
+        return -1;
+    }
+#else
+    if (!gmtime_r(&now, &utc_tm)) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "Could not convert system time");
+        return -1;
+    }
+#endif
+
+    char ts[32];
+    if (strftime(ts, sizeof(ts), "%Y%m%dT%H%M%SZ", &utc_tm) == 0) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "Could not format timestamp");
+        return -1;
+    }
+
+    char origin_slug[96];
+    char destination_slug[96];
+    sanitize_filename_component(origin_label, origin_slug, sizeof(origin_slug));
+    sanitize_filename_component(destination_label, destination_slug, sizeof(destination_slug));
+
+    char filename[320];
+    snprintf(filename, sizeof(filename), "%s_%s_%s.txt",
+             ts, origin_slug, destination_slug);
+
+    FILE *fp = fopen(filename, "w");
+    if (!fp) {
+        if (err && err_sz > 0) {
+            snprintf(err, err_sz, "Could not open %s: %s", filename, strerror(errno));
+        }
+        return -1;
+    }
+
+    char trip_dist[32], trip_dur[32];
+    route_format_distance(rr->total_distance_m, trip_dist, sizeof(trip_dist), 1);
+    route_format_duration(rr->total_duration_s, trip_dur, sizeof(trip_dur));
+
+    fprintf(fp, "RouteASCII Directions\n");
+    fprintf(fp, "GeneratedUTC: %04d-%02d-%02dT%02d:%02d:%02dZ\n",
+            utc_tm.tm_year + 1900, utc_tm.tm_mon + 1, utc_tm.tm_mday,
+            utc_tm.tm_hour, utc_tm.tm_min, utc_tm.tm_sec);
+    fprintf(fp, "Origin: %s\n",
+            (origin_label && origin_label[0]) ? origin_label : "unknown");
+    fprintf(fp, "Destination: %s\n",
+            (destination_label && destination_label[0]) ? destination_label : "unknown");
+    fprintf(fp, "Summary: %s, %s, %d steps\n\n",
+            trip_dist, trip_dur, rr->step_count);
+
+    for (int i = 0; i < rr->step_count; i++) {
+        const RouteStep *s = &rr->steps[i];
+        char step_dist[32], step_dur[32];
+
+        route_format_distance(s->distance_m, step_dist, sizeof(step_dist), 1);
+        route_format_duration(s->duration_s, step_dur, sizeof(step_dur));
+
+        fprintf(fp, "%d. %s\n", i + 1,
+                s->instruction[0] ? s->instruction : "continue");
+        if (s->road_name[0]) {
+            fprintf(fp, "   Road: %s\n", s->road_name);
+        }
+        fprintf(fp, "   Distance: %s\n", step_dist);
+        fprintf(fp, "   Duration: %s\n\n", step_dur);
+    }
+
+    if (fclose(fp) != 0) {
+        if (err && err_sz > 0) {
+            snprintf(err, err_sz, "Write failed for %s: %s", filename, strerror(errno));
+        }
+        return -1;
+    }
+
+    if (out_path && out_path_sz > 0) {
+        strncpy(out_path, filename, out_path_sz - 1);
+        out_path[out_path_sz - 1] = '\0';
+    }
+
+    return 0;
 }

@@ -115,7 +115,7 @@ void ui_draw_status(UIState *ui, MapView *mv, const char *message)
         snprintf(line2, sizeof(line2), " %s", message);
     } else {
         snprintf(line2, sizeof(line2),
-                 " [Arrows]Pan [+/-]Zoom [g]Goto [r]Route [d]Directions [c]Clear [q]Quit");
+                 " [Arrows]Pan [+/-]Zoom [g]Goto [r]Route [d]Directions [PgUp/PgDn]Scroll [p]Print [c]Clear [q]Quit");
     }
     mvwprintw(ui->status_win, 1, 0, "%-*s", ui->term_w, line2);
 

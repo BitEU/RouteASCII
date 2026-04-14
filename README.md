@@ -157,15 +157,17 @@ Known-good setup for this repo: full US dataset, local OSRM on `http://127.0.0.1
 
 ## Controls
 
-| Key          | Action                          |
-|--------------|---------------------------------|
-| Arrow keys   | Pan map                         |
-| +  /  -      | Zoom in / out                   |
-| g            | Goto — enter place name         |
-| r            | Route — enter origin & dest     |
-| d            | Toggle directions sidebar       |
-| c            | Clear route                     |
-| q / Esc      | Quit                            |
+| Key          | Action                               |
+|--------------|--------------------------------------|
+| Arrow keys   | Pan map                              |
+| +  /  -      | Zoom in / out                        |
+| g            | Goto — enter place name              |
+| r            | Route — enter origin & dest          |
+| d            | Toggle directions sidebar            |
+| PgUp / PgDn  | Scroll directions sidebar            |
+| p            | Print directions to timestamped file |
+| c            | Clear route                          |
+| q / Esc      | Quit                                 |
 
 ## Convert *osm.pbf to usable data
 

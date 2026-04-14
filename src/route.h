@@ -41,4 +41,12 @@ void route_format_duration(double seconds, char *buf, size_t buf_sz);
 /* Format distance in meters to "X.Y km" or "X.Y mi" string */
 void route_format_distance(double meters, char *buf, size_t buf_sz, int use_miles);
 
+/* Export turn-by-turn directions to a timestamped text file.
+    Filename format: YYYYMMDDTHHMMSSZ_origin_destination.txt */
+int route_export_directions(const RouteResult *rr,
+                                     const char *origin_label,
+                                     const char *destination_label,
+                                     char *out_path, size_t out_path_sz,
+                                     char *err, size_t err_sz);
+
 #endif /* ROUTE_H */

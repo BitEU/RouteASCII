@@ -114,6 +114,8 @@ int main(int argc, char *argv[])
 
     RouteResult route_result;
     memset(&route_result, 0, sizeof(route_result));
+    char route_origin_label[256] = "";
+    char route_dest_label[256] = "";
 
     char status_msg[256] = "";
 
@@ -246,6 +248,17 @@ int main(int argc, char *argv[])
                                        &overlay);
 
             if (route_result.valid) {
+                const char *resolved_orig = orig_geo.display_name[0]
+                    ? orig_geo.display_name : orig_str;
+                const char *resolved_dest = dest_geo.display_name[0]
+                    ? dest_geo.display_name : dest_str;
+                strncpy(route_origin_label, resolved_orig,
+                        sizeof(route_origin_label) - 1);
+                route_origin_label[sizeof(route_origin_label) - 1] = '\0';
+                strncpy(route_dest_label, resolved_dest,
+                        sizeof(route_dest_label) - 1);
+                route_dest_label[sizeof(route_dest_label) - 1] = '\0';
+
                 /* Auto-zoom to show the route */
                 double mid_lat = (orig_geo.lat + dest_geo.lat) / 2.0;
                 double mid_lon = (orig_geo.lon + dest_geo.lon) / 2.0;
@@ -281,6 +294,8 @@ int main(int argc, char *argv[])
                     ui_toggle_sidebar(&ui);
                 }
             } else {
+                route_origin_label[0] = '\0';
+                route_dest_label[0] = '\0';
                 snprintf(status_msg, sizeof(status_msg),
                          "Route error: %s", route_result.error);
                 fprintf(stderr, "[app] route error: %s\n", route_result.error);
@@ -293,10 +308,38 @@ int main(int argc, char *argv[])
             ui_toggle_sidebar(&ui);
             break;
 
+        case 'p':
+        case 'P': {
+            if (!route_result.valid || route_result.step_count <= 0) {
+                snprintf(status_msg, sizeof(status_msg),
+                         "No directions to print. Press [r] to route first.");
+                break;
+            }
+
+            char out_path[512];
+            char err_buf[256];
+            if (route_export_directions(&route_result,
+                                        route_origin_label,
+                                        route_dest_label,
+                                        out_path, sizeof(out_path),
+                                        err_buf, sizeof(err_buf)) == 0) {
+                snprintf(status_msg, sizeof(status_msg),
+                         "Directions saved: %s", out_path);
+                fprintf(stderr, "[app] directions exported to %s\n", out_path);
+            } else {
+                snprintf(status_msg, sizeof(status_msg),
+                         "Print failed: %s", err_buf);
+                fprintf(stderr, "[app] directions export failed: %s\n", err_buf);
+            }
+            break;
+        }
+
         case 'c':
         case 'C':
             route_overlay_clear(&overlay);
             memset(&route_result, 0, sizeof(route_result));
+            route_origin_label[0] = '\0';
+            route_dest_label[0] = '\0';
             snprintf(status_msg, sizeof(status_msg), "Route cleared.");
             fprintf(stderr, "[app] route cleared by user\n");
             if (ui.sidebar_visible) ui_toggle_sidebar(&ui);
