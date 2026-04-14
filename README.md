@@ -136,56 +136,23 @@ cmake --build build --config Release
 
 ## Local OSRM (recommended)
 
-RouteASCII now defaults to querying OSRM at `http://127.0.0.1:5000`.
-Use the helper script below to preprocess data and run `osrm-routed` in Docker.
+Known-good setup for this repo: full US dataset, local OSRM on `http://127.0.0.1:5000`.
 
-### Quick start on Windows
+### Build + start (Windows)
 
 ```powershell
-.\scripts\osrm-local.ps1 -Action all -PbfPath .\us-260408.osm.pbf
+.\scripts\osrm-local.ps1 -Action all -PbfPath .\us-260408.osm.pbf -ExtractThreads 24 -MinDockerMemoryGiB 128
 
 # Then run the app
 .\build\Release\routeascii.exe
 ```
 
-For full-US extracts, explicitly set safer concurrency and memory floor:
+### Useful operations
 
 ```powershell
-.\scripts\osrm-local.ps1 -Action all -PbfPath .\us-260408.osm.pbf -ExtractThreads 24 -MinDockerMemoryGiB 128
-```
-
-### Script actions
-
-```powershell
-.\scripts\osrm-local.ps1 -Action prep   # preprocess only
-.\scripts\osrm-local.ps1 -Action start  # preprocess if needed + run container
-.\scripts\osrm-local.ps1 -Action status # show container status
-.\scripts\osrm-local.ps1 -Action monitor # live CPU/log/file progress view
-.\scripts\osrm-local.ps1 -Action stop   # stop/remove container
-```
-
-Useful script parameters for US-scale builds:
-
-- `-ExtractThreads` (default `24`) lowers peak memory versus max-core extraction.
-- `-MinDockerMemoryGiB` (default `96`) blocks starts when Docker memory is too low.
-- `-NoMemoryGuard` bypasses the memory safety check (not recommended).
-
-### OSRM endpoint configuration
-
-Route query behavior can be controlled with environment variables:
-
-- `ROUTEASCII_OSRM_URL` (default: `http://127.0.0.1:5000`)
-- `ROUTEASCII_OSRM_TIMEOUT_S` (default: `25`)
-- `ROUTEASCII_OSRM_CONNECT_TIMEOUT_S` (default: `3`)
-- `ROUTEASCII_OSRM_FALLBACK_URL` (unset by default)
-- `ROUTEASCII_OSRM_FALLBACK_TIMEOUT_S` (default: `120`)
-- `ROUTEASCII_OSRM_FALLBACK_CONNECT_TIMEOUT_S` (default: `10`)
-
-Example with public fallback:
-
-```powershell
-$env:ROUTEASCII_OSRM_FALLBACK_URL = "https://router.project-osrm.org"
-.\build\Release\routeascii.exe
+.\scripts\osrm-local.ps1 -Action monitor  # live progress (extract/partition/customize)
+.\scripts\osrm-local.ps1 -Action status   # show running service/container state
+.\scripts\osrm-local.ps1 -Action stop     # stop local osrm-routed container
 ```
 
 ## Controls
