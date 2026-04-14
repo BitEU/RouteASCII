@@ -4,6 +4,9 @@ param(
     [string]$PbfPath = 'us-260408.osm.pbf',
     [ValidateSet('car', 'bicycle', 'foot')]
     [string]$RoutingProfile = 'car',
+    [int]$ExtractThreads = 24,
+    [int]$MinDockerMemoryGiB = 96,
+    [switch]$NoMemoryGuard,
     [string]$DataDir = 'data/osrm-local',
     [string]$Image = 'ghcr.io/project-osrm/osrm-backend:latest',
     [string]$ContainerName = 'routeascii-osrm',
@@ -21,6 +24,38 @@ function Assert-Docker {
     docker --version *> $null
     if ($LASTEXITCODE -ne 0) {
         throw 'Docker is required. Install Docker Desktop and ensure docker is on PATH.'
+    }
+}
+
+function Get-DockerMemoryGiB {
+    $bytes = docker info --format '{{.MemTotal}}'
+    if ($LASTEXITCODE -ne 0 -or -not $bytes) {
+        throw 'Unable to determine Docker memory limit from docker info.'
+    }
+
+    [double]$memBytes = $bytes
+    return [int][math]::Floor($memBytes / 1GB)
+}
+
+function Assert-DockerMemoryHeadroom {
+    if ($NoMemoryGuard) {
+        Write-Host '[osrm-local] memory guard disabled by -NoMemoryGuard.'
+        return
+    }
+
+    $dockerMemGiB = Get-DockerMemoryGiB
+    Write-Host "[osrm-local] docker memory visible to containers: ${dockerMemGiB}GiB"
+
+    if ($dockerMemGiB -lt $MinDockerMemoryGiB) {
+        throw "Docker memory is ${dockerMemGiB}GiB; require at least ${MinDockerMemoryGiB}GiB for safer US extraction. Increase Docker/WSL memory or pass -NoMemoryGuard."
+    }
+}
+
+function Warn-OtherRunningContainers {
+    $others = docker ps --filter "ancestor=$Image" --format '{{.Names}}' | Where-Object { $_ -ne $ContainerName }
+    if ($others) {
+        Write-Host '[osrm-local] warning: other OSRM containers are running:'
+        $others | ForEach-Object { Write-Host "  - $_" }
     }
 }
 
@@ -50,6 +85,13 @@ function Invoke-OsrmContainer([string[]]$arguments) {
 }
 
 function Initialize-PreprocessedData {
+    if ($ExtractThreads -lt 1) {
+        throw 'ExtractThreads must be >= 1.'
+    }
+
+    Assert-DockerMemoryHeadroom
+    Warn-OtherRunningContainers
+
     $inputPbf = Resolve-InputPbf
     $pbfName = [System.IO.Path]::GetFileName($inputPbf)
 
@@ -69,8 +111,8 @@ function Initialize-PreprocessedData {
     $osrmFile = Join-Path $dataDirAbs "$datasetBase.osrm"
 
     if ($Force -or -not (Test-Path -LiteralPath $osrmFile)) {
-        Write-Host '[osrm-local] extracting graph...'
-        Invoke-OsrmContainer @('osrm-extract', '-p', "/opt/$RoutingProfile.lua", "/data/$pbfName")
+        Write-Host "[osrm-local] extracting graph (threads=$ExtractThreads)..."
+        Invoke-OsrmContainer @('osrm-extract', '-t', "$ExtractThreads", '-p', "/opt/$RoutingProfile.lua", "/data/$pbfName")
 
         Write-Host '[osrm-local] partitioning graph (MLD)...'
         Invoke-OsrmContainer @('osrm-partition', "/data/$datasetBase.osrm")
@@ -115,6 +157,8 @@ function Stop-Osrm {
 
 function Show-Status {
     docker ps --filter "name=^/$ContainerName$"
+    $dockerMemGiB = Get-DockerMemoryGiB
+    Write-Host "[osrm-local] docker memory: ${dockerMemGiB}GiB"
     Write-Host "[osrm-local] expected endpoint: http://127.0.0.1:$Port"
 }
 

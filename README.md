@@ -148,6 +148,12 @@ Use the helper script below to preprocess data and run `osrm-routed` in Docker.
 .\build\Release\routeascii.exe
 ```
 
+For full-US extracts, explicitly set safer concurrency and memory floor:
+
+```powershell
+.\scripts\osrm-local.ps1 -Action all -PbfPath .\us-260408.osm.pbf -ExtractThreads 24 -MinDockerMemoryGiB 128
+```
+
 ### Script actions
 
 ```powershell
@@ -157,6 +163,12 @@ Use the helper script below to preprocess data and run `osrm-routed` in Docker.
 .\scripts\osrm-local.ps1 -Action monitor # live CPU/log/file progress view
 .\scripts\osrm-local.ps1 -Action stop   # stop/remove container
 ```
+
+Useful script parameters for US-scale builds:
+
+- `-ExtractThreads` (default `24`) lowers peak memory versus max-core extraction.
+- `-MinDockerMemoryGiB` (default `96`) blocks starts when Docker memory is too low.
+- `-NoMemoryGuard` bypasses the memory safety check (not recommended).
 
 ### OSRM endpoint configuration
 
